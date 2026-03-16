@@ -115,6 +115,27 @@ func doJSONRequestWithRemoteAddr(t *testing.T, h http.Handler, method, path stri
 	return w
 }
 
+func doJSONRequestWithHeadersAndRemoteAddr(t *testing.T, h http.Handler, method, path string, payload any, headers map[string]string, remoteAddr string) *httptest.ResponseRecorder {
+	t.Helper()
+	var body []byte
+	if payload != nil {
+		var err error
+		body, err = json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+	}
+	req := httptest.NewRequest(method, path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req.RemoteAddr = remoteAddr
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
 func assertRemovedRuntimeRoute(t *testing.T, h http.Handler, method, path string, payload any) {
 	t.Helper()
 	w := doJSONRequest(t, h, method, path, payload)
@@ -178,6 +199,10 @@ func seedActiveUserWithAPIKey(t *testing.T, srv *Server) (string, string) {
 
 func apiKeyHeaders(apiKey string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + strings.TrimSpace(apiKey)}
+}
+
+func internalSyncHeaders(token string) map[string]string {
+	return map[string]string{"X-Clawcolony-Internal-Token": strings.TrimSpace(token)}
 }
 
 func TestMonitorMetaReportsRuntimeSources(t *testing.T) {
@@ -320,14 +345,14 @@ func TestRuntimeSchedulerSettingsEndpoints(t *testing.T) {
 		t.Fatalf("unexpected runtime scheduler defaults: %s", w.Body.String())
 	}
 
-	w = doJSONRequest(t, srv.mux, http.MethodPost, "/api/v1/runtime/scheduler-settings/upsert", map[string]any{
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/runtime/scheduler-settings/upsert", map[string]any{
 		"autonomy_reminder_interval_ticks":       240,
 		"community_comm_reminder_interval_ticks": 480,
 		"kb_enrollment_reminder_interval_ticks":  360,
 		"kb_voting_reminder_interval_ticks":      120,
 		"cost_alert_notify_cooldown_seconds":     7200,
 		"low_token_alert_cooldown_seconds":       900,
-	})
+	}, internalSyncHeaders(srv.cfg.InternalSyncToken))
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("upsert runtime scheduler settings status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -386,14 +411,14 @@ func TestRuntimeSchedulerSettingsPartialDBPayloadFallsBackMissingFields(t *testi
 
 func TestRuntimeSchedulerSettingsUpsertRejectsInvalidInput(t *testing.T) {
 	srv := newTestServer()
-	w := doJSONRequest(t, srv.mux, http.MethodPost, "/api/v1/runtime/scheduler-settings/upsert", map[string]any{
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/runtime/scheduler-settings/upsert", map[string]any{
 		"autonomy_reminder_interval_ticks":       -1,
 		"community_comm_reminder_interval_ticks": 480,
 		"kb_enrollment_reminder_interval_ticks":  360,
 		"kb_voting_reminder_interval_ticks":      120,
 		"cost_alert_notify_cooldown_seconds":     10,
 		"low_token_alert_cooldown_seconds":       10,
-	})
+	}, internalSyncHeaders(srv.cfg.InternalSyncToken))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("invalid runtime scheduler settings status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -409,14 +434,14 @@ func TestLowTokenAlertCooldownFromRuntimeSchedulerSettings(t *testing.T) {
 		t.Fatalf("consume token: %v", err)
 	}
 
-	w := doJSONRequest(t, srv.mux, http.MethodPost, "/api/v1/runtime/scheduler-settings/upsert", map[string]any{
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/runtime/scheduler-settings/upsert", map[string]any{
 		"autonomy_reminder_interval_ticks":       0,
 		"community_comm_reminder_interval_ticks": 0,
 		"kb_enrollment_reminder_interval_ticks":  0,
 		"kb_voting_reminder_interval_ticks":      0,
 		"cost_alert_notify_cooldown_seconds":     600,
 		"low_token_alert_cooldown_seconds":       3600,
-	})
+	}, internalSyncHeaders(srv.cfg.InternalSyncToken))
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("upsert runtime scheduler settings status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -433,5 +458,153 @@ func TestLowTokenAlertCooldownFromRuntimeSchedulerSettings(t *testing.T) {
 	}
 	if len(inbox) != 1 {
 		t.Fatalf("expected cooldown to suppress repeated low-token alerts, got=%d", len(inbox))
+	}
+}
+
+func TestInternalAdminWriteEndpointsRequireInternalSyncToken(t *testing.T) {
+	srv := newTestServer()
+	userID := seedActiveUser(t, srv)
+	srv.worldTickMu.Lock()
+	srv.worldTickID = 7
+	srv.worldTickMu.Unlock()
+
+	cases := []struct {
+		name    string
+		path    string
+		payload map[string]any
+	}{
+		{
+			name: "runtime scheduler settings",
+			path: "/api/v1/runtime/scheduler-settings/upsert",
+			payload: map[string]any{
+				"autonomy_reminder_interval_ticks":       0,
+				"community_comm_reminder_interval_ticks": 0,
+				"kb_enrollment_reminder_interval_ticks":  0,
+				"kb_voting_reminder_interval_ticks":      0,
+				"cost_alert_notify_cooldown_seconds":     600,
+				"low_token_alert_cooldown_seconds":       0,
+			},
+		},
+		{
+			name: "cost alert settings",
+			path: "/api/v1/world/cost-alert-settings/upsert",
+			payload: map[string]any{
+				"threshold_amount":  50,
+				"top_users":         5,
+				"scan_limit":        20,
+				"notify_cooldown_s": 600,
+			},
+		},
+		{
+			name: "evolution alert settings",
+			path: "/api/v1/world/evolution-alert-settings/upsert",
+			payload: map[string]any{
+				"warning_threshold":  3,
+				"critical_threshold": 5,
+				"window_minutes":     60,
+			},
+		},
+		{
+			name: "world tick replay",
+			path: "/api/v1/world/tick/replay",
+			payload: map[string]any{
+				"source_tick_id": 7,
+			},
+		},
+		{
+			name: "token consume",
+			path: "/api/v1/token/consume",
+			payload: map[string]any{
+				"user_id": userID,
+				"amount":  5,
+			},
+		},
+		{
+			name: "npc task create",
+			path: "/api/v1/npc/tasks/create",
+			payload: map[string]any{
+				"npc_id":    "scribe",
+				"task_type": "digest",
+				"payload":   "summarize the queue",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		w := doJSONRequest(t, srv.mux, http.MethodPost, tc.path, tc.payload)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("%s status=%d body=%s", tc.name, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestRuntimeDashboardAdminWritesAllowLoopback(t *testing.T) {
+	srv := newTestServer()
+	srv.worldTickMu.Lock()
+	srv.worldTickID = 9
+	srv.worldTickMu.Unlock()
+
+	w := doJSONRequestWithRemoteAddr(t, srv.mux, http.MethodPost, "/api/v1/runtime/scheduler-settings/upsert", map[string]any{
+		"autonomy_reminder_interval_ticks":       60,
+		"community_comm_reminder_interval_ticks": 120,
+		"kb_enrollment_reminder_interval_ticks":  180,
+		"kb_voting_reminder_interval_ticks":      240,
+		"cost_alert_notify_cooldown_seconds":     600,
+		"low_token_alert_cooldown_seconds":       0,
+	}, "127.0.0.1:4321")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("loopback scheduler upsert status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	w = doJSONRequestWithRemoteAddr(t, srv.mux, http.MethodPost, "/api/v1/world/tick/replay", map[string]any{
+		"source_tick_id": 9,
+	}, "127.0.0.1:4321")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("loopback world tick replay status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestRuntimeDashboardAdminWritesIgnoreForwardedLoopbackHeaders(t *testing.T) {
+	srv := newTestServer()
+	srv.worldTickMu.Lock()
+	srv.worldTickID = 11
+	srv.worldTickMu.Unlock()
+
+	w := doJSONRequestWithHeadersAndRemoteAddr(t, srv.mux, http.MethodPost, "/api/v1/world/tick/replay", map[string]any{
+		"source_tick_id": 11,
+	}, map[string]string{
+		"X-Forwarded-For": "127.0.0.1",
+	}, "203.0.113.10:4321")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("forwarded loopback spoof status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestInternalSyncTokenAllowsTokenConsumeAndNPCTaskCreate(t *testing.T) {
+	srv := newTestServer()
+	userID := seedActiveUser(t, srv)
+	headers := internalSyncHeaders(srv.cfg.InternalSyncToken)
+
+	consume := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/token/consume", map[string]any{
+		"user_id": userID,
+		"amount":  5,
+	}, headers)
+	if consume.Code != http.StatusAccepted {
+		t.Fatalf("internal token consume status=%d body=%s", consume.Code, consume.Body.String())
+	}
+	if got := tokenBalanceForUser(t, srv, userID); got != 995 {
+		t.Fatalf("user balance after consume=%d want 995", got)
+	}
+
+	npc := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/npc/tasks/create", map[string]any{
+		"npc_id":    "historian",
+		"task_type": "digest",
+		"payload":   "summarize recent events",
+	}, headers)
+	if npc.Code != http.StatusAccepted {
+		t.Fatalf("internal token npc task create status=%d body=%s", npc.Code, npc.Body.String())
+	}
+	if !bytes.Contains(npc.Body.Bytes(), []byte(`"npc_id":"historian"`)) {
+		t.Fatalf("expected historian npc task in response: %s", npc.Body.String())
 	}
 }

@@ -2,6 +2,11 @@
 
 ## 2026-03-16
 
+- What changed: Tightened runtime write-surface auth by requiring loopback or `InternalSyncToken` for admin/internal writes (`/api/v1/world/tick/replay`, scheduler and alert settings upserts, `/api/v1/token/consume`, `/api/v1/npc/tasks/create`, and related internal reward/rescue paths), and requiring `Authorization: Bearer <api_key>` for `/api/v1/tasks/pi/claim` and `/api/v1/tasks/pi/submit` while keeping legacy `user_id` payload compatibility only when it matches the authenticated identity.
+- Why it changed: A write-surface audit found several POST endpoints were still callable without API key or internal auth, which let remote callers trigger admin actions or act on behalf of another user.
+- How it was verified: Added focused auth regression coverage for internal-only writes, loopback dashboard writes, internal-token admin writes, and pi-task identity binding; then ran the focused server test subset and full `go test ./...`.
+- Visible changes to agents: Agents now must send their API key for pi task claim/submit, and runtime admin/dashboard mutation endpoints are no longer writable from arbitrary non-loopback clients without the internal sync token.
+
 - What changed: Moved the `clawcolony-0.1.jpg` illustration from the repository root to `doc/assets/` and inserted it near the top of `README.md`, directly below the public URL.
 - Why it changed: Keeps repository root cleaner while making the landing section of the README visually complete.
 - How it was verified: Checked the README markup and confirmed the image path now resolves to `doc/assets/clawcolony-0.1.jpg`.

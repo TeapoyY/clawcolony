@@ -217,10 +217,10 @@ func TestTokenWishFulfillReturnsConflictWhenTreasuryInsufficient(t *testing.T) {
 func TestPiTaskSubmitConsumesTreasury(t *testing.T) {
 	srv := newTestServer()
 	srv.cfg.TreasuryInitialToken = 100
-	userID := seedActiveUser(t, srv)
+	userID, apiKey := seedActiveUserWithAPIKey(t, srv)
 	before := treasuryBalanceForTest(t, srv)
 
-	w := doJSONRequest(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/claim", map[string]any{"user_id": userID})
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/claim", map[string]any{"user_id": userID}, apiKeyHeaders(apiKey))
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("pi claim status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -236,11 +236,11 @@ func TestPiTaskSubmitConsumesTreasury(t *testing.T) {
 	task := srv.piTasks[claim.Item.TaskID]
 	srv.taskMu.Unlock()
 
-	w = doJSONRequest(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/submit", map[string]any{
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/submit", map[string]any{
 		"user_id": userID,
 		"task_id": task.TaskID,
 		"answer":  task.Expected,
-	})
+	}, apiKeyHeaders(apiKey))
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("pi submit status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -255,12 +255,12 @@ func TestPiTaskSubmitConsumesTreasury(t *testing.T) {
 func TestPiTaskSubmitRejectsWhenTreasuryInsufficient(t *testing.T) {
 	srv := newTestServer()
 	srv.cfg.TreasuryInitialToken = 1
-	userID := seedActiveUser(t, srv)
+	userID, apiKey := seedActiveUserWithAPIKey(t, srv)
 	if got := treasuryBalanceForTest(t, srv); got != 1 {
 		t.Fatalf("initial treasury=%d want 1", got)
 	}
 
-	w := doJSONRequest(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/claim", map[string]any{"user_id": userID})
+	w := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/claim", map[string]any{"user_id": userID}, apiKeyHeaders(apiKey))
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("pi claim status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -276,11 +276,11 @@ func TestPiTaskSubmitRejectsWhenTreasuryInsufficient(t *testing.T) {
 	task := srv.piTasks[claim.Item.TaskID]
 	srv.taskMu.Unlock()
 
-	w = doJSONRequest(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/submit", map[string]any{
+	w = doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/submit", map[string]any{
 		"user_id": userID,
 		"task_id": task.TaskID,
 		"answer":  task.Expected,
-	})
+	}, apiKeyHeaders(apiKey))
 	if w.Code != http.StatusConflict {
 		t.Fatalf("pi submit insufficient status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -360,12 +360,13 @@ func TestSystemAccountsCannotUseTokenUserFlows(t *testing.T) {
 			wantErr: "system accounts cannot create wishes",
 		},
 		{
-			name: "pi claim by admin rejected",
-			path: "/api/v1/tasks/pi/claim",
+			name:    "pi claim by admin rejected",
+			path:    "/api/v1/tasks/pi/claim",
+			headers: apiKeyHeaders(treasuryAPIKey),
 			payload: map[string]any{
-				"user_id": clawWorldSystemID,
+				"user_id": clawTreasurySystemID,
 			},
-			wantErr: "user_id is required",
+			wantErr: "system users cannot claim tasks",
 		},
 	}
 
@@ -377,5 +378,62 @@ func TestSystemAccountsCannotUseTokenUserFlows(t *testing.T) {
 		if !strings.Contains(w.Body.String(), tc.wantErr) {
 			t.Fatalf("%s missing %q in %s", tc.name, tc.wantErr, w.Body.String())
 		}
+	}
+}
+
+func TestPiTaskEndpointsRequireAPIKeyAndBindIdentity(t *testing.T) {
+	srv := newTestServer()
+	userID, apiKey := seedActiveUserWithAPIKey(t, srv)
+	otherUserID, otherAPIKey := seedActiveUserWithAPIKey(t, srv)
+
+	unauthClaim := doJSONRequest(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/claim", map[string]any{
+		"user_id": userID,
+	})
+	if unauthClaim.Code != http.StatusUnauthorized {
+		t.Fatalf("unauth claim status=%d body=%s", unauthClaim.Code, unauthClaim.Body.String())
+	}
+
+	mismatchClaim := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/claim", map[string]any{
+		"user_id": otherUserID,
+	}, apiKeyHeaders(apiKey))
+	if mismatchClaim.Code != http.StatusForbidden {
+		t.Fatalf("mismatch claim status=%d body=%s", mismatchClaim.Code, mismatchClaim.Body.String())
+	}
+
+	claim := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/claim", map[string]any{
+		"user_id": userID,
+	}, apiKeyHeaders(apiKey))
+	if claim.Code != http.StatusAccepted {
+		t.Fatalf("claim status=%d body=%s", claim.Code, claim.Body.String())
+	}
+	var claimBody struct {
+		Item struct {
+			TaskID string `json:"task_id"`
+			UserID string `json:"user_id"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(claim.Body.Bytes(), &claimBody); err != nil {
+		t.Fatalf("unmarshal claim body: %v", err)
+	}
+	if claimBody.Item.UserID != userID {
+		t.Fatalf("claim user_id=%s want %s", claimBody.Item.UserID, userID)
+	}
+
+	unauthSubmit := doJSONRequest(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/submit", map[string]any{
+		"user_id": userID,
+		"task_id": claimBody.Item.TaskID,
+		"answer":  "0",
+	})
+	if unauthSubmit.Code != http.StatusUnauthorized {
+		t.Fatalf("unauth submit status=%d body=%s", unauthSubmit.Code, unauthSubmit.Body.String())
+	}
+
+	mismatchSubmit := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/tasks/pi/submit", map[string]any{
+		"user_id": userID,
+		"task_id": claimBody.Item.TaskID,
+		"answer":  "0",
+	}, apiKeyHeaders(otherAPIKey))
+	if mismatchSubmit.Code != http.StatusForbidden {
+		t.Fatalf("mismatch submit status=%d body=%s", mismatchSubmit.Code, mismatchSubmit.Body.String())
 	}
 }
