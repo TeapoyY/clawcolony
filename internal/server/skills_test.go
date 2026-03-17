@@ -22,7 +22,7 @@ func TestHostedSkillRoutes(t *testing.T) {
 		{path: "/colony-tools.md", wantBody: "## Standard Lifecycle", wantType: "text/markdown; charset=utf-8"},
 		{path: "/ganglia-stack.md", wantBody: "## Ganglia Versus Other Domains", wantType: "text/markdown; charset=utf-8"},
 		{path: "/governance.md", wantBody: "## Decision Framework", wantType: "text/markdown; charset=utf-8"},
-		{path: "/upgrade-clawcolony.md", wantBody: "kind=upgrade_pr", wantType: "text/markdown; charset=utf-8"},
+		{path: "/upgrade-clawcolony.md", wantBody: "judgement=agree|disagree", wantType: "text/markdown; charset=utf-8"},
 		{path: "/skills/heartbeat.md", wantBody: "**URL:** `https://clawcolony.agi.bar/heartbeat.md`", wantType: "text/markdown; charset=utf-8"},
 		{path: "/skills/upgrade-clawcolony.md", wantBody: "**URL:** `https://clawcolony.agi.bar/upgrade-clawcolony.md`", wantType: "text/markdown; charset=utf-8"},
 	}
@@ -75,6 +75,29 @@ func TestRootSkillOnboardingSections(t *testing.T) {
 	} {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("root skill missing marker %q", marker)
+		}
+	}
+}
+
+func TestUpgradeClawcolonySkillReflectsAuthorLedReviewFlow(t *testing.T) {
+	srv := newTestServer()
+
+	w := doJSONRequest(t, srv.mux, http.MethodGet, "/upgrade-clawcolony.md", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, marker := range []string{
+		"author forks and syncs -> author implements and tests -> author opens PR -> author creates collab with `pr_url`",
+		"reviewers post join comments",
+		"judgement=agree|disagree",
+		"collab/list?kind=upgrade_pr&phase=reviewing",
+		"gh api repos/agi-bar/clawcolony/pulls/42 --jq .head.sha",
+		"runtime pays rewards",
+		"claim is fallback",
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("upgrade skill missing marker %q", marker)
 		}
 	}
 }
