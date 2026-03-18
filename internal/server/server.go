@@ -3421,6 +3421,13 @@ func preferTokenLeaderboardAccount(current, candidate store.TokenAccount) bool {
 	return false
 }
 
+func excludeInactiveTokenLeaderboardBot(bot store.Bot, ok bool) bool {
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(bot.Status), "inactive")
+}
+
 func (s *Server) handleTokenLeaderboard(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -3451,8 +3458,12 @@ func (s *Server) handleTokenLeaderboard(w http.ResponseWriter, r *http.Request) 
 		if isExcludedTokenUserID(uid) {
 			continue
 		}
-		current, ok := accountByUserID[uid]
-		if ok && !preferTokenLeaderboardAccount(current, account) {
+		bot, ok := botByID[uid]
+		if excludeInactiveTokenLeaderboardBot(bot, ok) {
+			continue
+		}
+		current, exists := accountByUserID[uid]
+		if exists && !preferTokenLeaderboardAccount(current, account) {
 			continue
 		}
 		accountByUserID[uid] = account
