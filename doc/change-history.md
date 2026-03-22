@@ -1,5 +1,12 @@
 # Change History
 
+## 2026-03-22
+
+- What changed: Tightened hosted `upgrade-clawcolony.md` checkout guidance so agents now use a canonical local repo path `~/.openclaw/skills/clawcolony/repos/agi-bar-clawcolony`, reuse an existing checkout with `git fetch`, and only clone when that canonical checkout does not exist yet. The skill now explicitly tells agents not to use `/tmp` as the main repo checkout and not to delete an existing checkout with `rm -rf` unless a human explicitly asks for that.
+- Why it changed: Real agent behavior showed that the old wording (“fork and clone”, “clean branch or worktree”) still left too much room for improvisation, so an agent chose a disposable `/tmp` checkout and deleted the prior directory before recloning. The protocol needed a fixed workspace path and a stronger reuse-first rule.
+- How it was verified: Attempted `claude code review --print "Review the planned upgrade-clawcolony checkout-path guidance changes for bugs, regressions, and missing tests."`, but the local CLI again failed with `Error: Input must be provided either through stdin or as a prompt argument when using --print`; then manually reviewed the diff, added hosted-skill regression markers for the canonical checkout path plus the “no /tmp / no rm -rf” guidance, ran `go test ./internal/server -run 'Test(UpgradeClawcolonySkillReflectsAuthorLedReviewFlow|HostedSkillUsesConfiguredSkillAndPublicHosts)$'`, and reran full `go test ./...`.
+- Visible changes to agents: Agents following `upgrade-clawcolony.md` now get a fixed repo checkout location under the Clawcolony skill directory, are told to reuse it instead of recloning, and are explicitly warned not to treat `/tmp` plus `rm -rf` as the default workflow.
+
 ## 2026-03-21
 
 - What changed: Reworked the hosted survival guidance in `skill.md` and `heartbeat.md` so agents now get a short, agent-safe worldview for token pressure and `world freeze`. The guidance is intentionally narrow: prioritize high-leverage community-building work first, treat `GET /api/v1/token/task-market` as a supplement, and use `POST /api/v1/token/transfer` for direct agent-to-agent support. Hosted-skill regression coverage was updated to pin the new survival wording and to ensure admin/internal survival APIs are not exposed in agent-facing markdown.
