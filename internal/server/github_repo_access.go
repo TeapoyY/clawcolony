@@ -1058,6 +1058,59 @@ func githubRepoAccessInactivePayload(cfg gitHubAppAccessConfig) map[string]any {
 	}
 }
 
+func callbackRouteWithQuery(target string, values neturl.Values) string {
+	trimmed := strings.TrimSpace(target)
+	if trimmed == "" {
+		return ""
+	}
+	u, err := neturl.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	query := u.Query()
+	for key, vals := range values {
+		if len(vals) == 0 {
+			continue
+		}
+		query.Del(key)
+		for _, value := range vals {
+			query.Add(key, value)
+		}
+	}
+	u.RawQuery = query.Encode()
+	return u.String()
+}
+
+func (s *Server) gitHubRepoAccessCallbackTarget(state gitHubRepoAccessStatePayload, callbackRoute string, values neturl.Values) string {
+	if strings.EqualFold(strings.TrimSpace(state.Flow), "claim") && strings.TrimSpace(state.ClaimToken) != "" {
+		return s.claimFrontendCallbackURL(state.ClaimToken, values)
+	}
+	if route := callbackRouteWithQuery(callbackRoute, values); route != "" {
+		return route
+	}
+	if strings.EqualFold(strings.TrimSpace(state.Flow), "social") {
+		return s.socialCallbackRedirectURL("github", values)
+	}
+	return s.gitHubAccessFrontendCallbackURL(values)
+}
+
+func (s *Server) completeGitHubAppSocialConnect(ctx context.Context, owner store.HumanOwner, userID string, payload gitHubRepoAccessCallbackCookiePayload, grant store.GitHubRepoAccessGrant) (map[string]any, error) {
+	link, grants, err := s.completeGitHubSocialLinkAndRewards(ctx, owner, userID, payload.GitHubLogin, payload.GitHubUserID, payload.Starred, payload.Forked, "social.github.app")
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"item":          link,
+		"grants":        grants,
+		"starred":       payload.Starred,
+		"forked":        payload.Forked,
+		"repo":          s.officialGitHubRepo(),
+		"username":      payload.GitHubLogin,
+		"owner":         owner,
+		"github_access": s.gitHubRepoAccessStatusPayload(grant),
+	}, nil
+}
+
 func githubRepoAccessStatus(grant store.GitHubRepoAccessGrant) string {
 	if strings.TrimSpace(grant.OwnerID) == "" {
 		return "not_connected"
@@ -1188,6 +1241,21 @@ func (s *Server) gitHubAccessFrontendCallbackURL(values neturl.Values) string {
 	return u.String()
 }
 
+func (s *Server) gitHubRepoAccessInactivePayloadWithLegacyIdentity(ctx context.Context, cfg gitHubAppAccessConfig, ownerID string) map[string]any {
+	payload := githubRepoAccessInactivePayload(cfg)
+	owner, err := s.store.GetHumanOwner(ctx, ownerID)
+	if err != nil {
+		return payload
+	}
+	if githubUsername := strings.TrimSpace(owner.GitHubUsername); githubUsername != "" {
+		payload["github_username"] = githubUsername
+		payload["github_user_id"] = strings.TrimSpace(owner.GitHubUserID)
+		payload["legacy_social_data_detected"] = true
+		payload["next_action"] = "complete GitHub App authorization to connect repo access"
+	}
+	return payload
+}
+
 func (s *Server) gitHubRepoAccessReauthorizeURL(r *http.Request, ownerID, userID string) (string, error) {
 	ownerID = strings.TrimSpace(ownerID)
 	if ownerID == "" {
@@ -1230,16 +1298,19 @@ func (s *Server) augmentGitHubRepoAccessReauthorizePayload(r *http.Request, payl
 	return payload
 }
 
-func (s *Server) writeGitHubRepoAccessCallbackError(w http.ResponseWriter, r *http.Request, state gitHubRepoAccessStatePayload, msg string) {
+func (s *Server) writeGitHubRepoAccessCallbackError(w http.ResponseWriter, r *http.Request, state gitHubRepoAccessStatePayload, callbackRoute, msg string) {
 	s.clearGitHubRepoAccessOAuthCookie(w, r)
 	s.clearGitHubRepoAccessCallbackCookie(w, r)
 	values := neturl.Values{}
 	values.Set("status", "error")
 	values.Set("error", msg)
-	target := s.gitHubAccessFrontendCallbackURL(values)
-	if strings.EqualFold(strings.TrimSpace(state.Flow), "claim") && strings.TrimSpace(state.ClaimToken) != "" {
-		target = s.claimFrontendCallbackURL(state.ClaimToken, values)
+	if strings.EqualFold(strings.TrimSpace(state.Flow), "social") {
+		values.Set("provider", "github")
+		if userID := strings.TrimSpace(state.UserID); userID != "" {
+			values.Set("user_id", userID)
+		}
 	}
+	target := s.gitHubRepoAccessCallbackTarget(state, callbackRoute, values)
 	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
@@ -1261,7 +1332,7 @@ func (s *Server) handleGitHubRepoAccessStatus(w http.ResponseWriter, r *http.Req
 	grant, err := s.ensureGitHubRepoAccessGrant(r.Context(), session.OwnerID)
 	if err != nil {
 		if errors.Is(err, store.ErrGitHubRepoAccessGrantNotFound) {
-			writeJSON(w, http.StatusOK, githubRepoAccessInactivePayload(cfg))
+			writeJSON(w, http.StatusOK, s.gitHubRepoAccessInactivePayloadWithLegacyIdentity(r.Context(), cfg, session.OwnerID))
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1377,7 +1448,8 @@ func (s *Server) handleGitHubRepoAccessToken(w http.ResponseWriter, r *http.Requ
 	grant, err := s.ensureGitHubRepoAccessGrant(r.Context(), binding.OwnerID)
 	if err != nil {
 		if errors.Is(err, store.ErrGitHubRepoAccessGrantNotFound) {
-			writeJSON(w, http.StatusConflict, s.augmentGitHubRepoAccessReauthorizePayload(r, githubRepoAccessInactivePayload(cfg), binding.OwnerID, userID))
+			payload := s.gitHubRepoAccessInactivePayloadWithLegacyIdentity(r.Context(), cfg, binding.OwnerID)
+			writeJSON(w, http.StatusConflict, s.augmentGitHubRepoAccessReauthorizePayload(r, payload, binding.OwnerID, userID))
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1442,63 +1514,80 @@ func (s *Server) handleGitHubRepoAccessCallback(w http.ResponseWriter, r *http.R
 	if rawState != "" {
 		_ = s.verifySocialOAuthPayload(rawState, &state)
 	}
+	var cookiePayload gitHubRepoAccessCookiePayload
+	if payload, err := s.readGitHubRepoAccessOAuthCookie(r); err == nil {
+		cookiePayload = payload
+	}
 	if providerErr := strings.TrimSpace(r.URL.Query().Get("error")); providerErr != "" {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, providerErr)
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, providerErr)
 		return
 	}
 	code := strings.TrimSpace(r.URL.Query().Get("code"))
 	if rawState == "" || code == "" {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, "oauth callback requires code and state")
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, "oauth callback requires code and state")
 		return
 	}
 	if err := s.verifySocialOAuthPayload(rawState, &state); err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
 		return
 	}
 	if state.ExpiresAt < time.Now().UTC().Unix() {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, "oauth state expired")
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, "oauth state expired")
 		return
 	}
 	cookiePayload, err := s.readGitHubRepoAccessOAuthCookie(r)
 	if err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+		s.writeGitHubRepoAccessCallbackError(w, r, state, "", err.Error())
 		return
 	}
 	if cookiePayload.Flow != state.Flow || cookiePayload.ClaimToken != state.ClaimToken || cookiePayload.UserID != state.UserID || cookiePayload.OwnerID != state.OwnerID || cookiePayload.Nonce != state.Nonce {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, "oauth cookie mismatch")
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, "oauth cookie mismatch")
 		return
 	}
 	cfg, ok := s.gitHubAppAccessConfig()
 	if !ok {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, "github repo access is not configured")
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, "github repo access is not configured")
 		return
 	}
 	if strings.EqualFold(strings.TrimSpace(state.Flow), "claim") {
 		if _, err := s.getClaimRegistration(r.Context(), state.ClaimToken); err != nil {
-			s.writeGitHubRepoAccessCallbackError(w, r, state, s.claimLookupErrorMessage(err))
+			s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, s.claimLookupErrorMessage(err))
 			return
 		}
-	} else if strings.EqualFold(strings.TrimSpace(state.Flow), "owner") {
+	} else if strings.EqualFold(strings.TrimSpace(state.Flow), "owner") || strings.EqualFold(strings.TrimSpace(state.Flow), "social") {
 		if _, err := s.store.GetHumanOwner(r.Context(), state.OwnerID); err != nil {
-			s.writeGitHubRepoAccessCallbackError(w, r, state, "owner session is invalid")
+			s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, "owner session is invalid")
 			return
+		}
+		if strings.EqualFold(strings.TrimSpace(state.Flow), "social") {
+			binding, err := s.store.GetAgentHumanBinding(r.Context(), state.UserID)
+			if err != nil {
+				s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
+				return
+			}
+			if strings.TrimSpace(binding.OwnerID) != strings.TrimSpace(state.OwnerID) {
+				s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, "owner session does not own this agent")
+				return
+			}
 		}
 	} else {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, "unsupported github access flow")
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, "unsupported github access flow")
 		return
 	}
 	token, err := s.exchangeGitHubAppCode(r.Context(), cfg, code, s.gitHubRepoAccessCallbackURI(r), cookiePayload.CodeVerifier)
 	if err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
 		return
 	}
 	resolved, err := s.resolveGitHubRepoAccess(r.Context(), cfg, token.AccessToken)
 	if err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
 		return
 	}
 	var owner store.HumanOwner
 	if strings.EqualFold(strings.TrimSpace(state.Flow), "owner") {
+		owner, err = s.store.GetHumanOwner(r.Context(), state.OwnerID)
+	} else if strings.EqualFold(strings.TrimSpace(state.Flow), "social") {
 		owner, err = s.store.GetHumanOwner(r.Context(), state.OwnerID)
 	} else {
 		owner, err = s.store.GetHumanOwnerByEmail(r.Context(), resolved.Email)
@@ -1507,26 +1596,27 @@ func (s *Server) handleGitHubRepoAccessCallback(w http.ResponseWriter, r *http.R
 		}
 	}
 	if err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
 		return
 	}
-	if _, err := s.store.UpsertHumanOwnerSocialIdentity(r.Context(), owner.OwnerID, "github", resolved.GitHubLogin, resolved.GitHubUserID); err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+	owner, err = s.store.UpsertHumanOwnerSocialIdentity(r.Context(), owner.OwnerID, "github", resolved.GitHubLogin, resolved.GitHubUserID)
+	if err != nil {
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
 		return
 	}
 	savedGrant, err := s.saveGitHubRepoAccessGrant(r.Context(), owner, resolved, token)
 	if err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
 		return
 	}
 	starred, err := s.verifyGitHubStar(r.Context(), resolved.GitHubLogin)
 	if err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
 		return
 	}
 	forked, err := s.verifyGitHubFork(r.Context(), resolved.GitHubLogin)
 	if err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
 		return
 	}
 	resolved.Flow = state.Flow
@@ -1537,10 +1627,29 @@ func (s *Server) handleGitHubRepoAccessCallback(w http.ResponseWriter, r *http.R
 	resolved.Forked = forked
 	resolved.ExpiresAt = time.Now().UTC().Add(githubRepoAccessResultTTL).Unix()
 	if err := s.writeGitHubRepoAccessCallbackCookie(w, r, resolved); err != nil {
-		s.writeGitHubRepoAccessCallbackError(w, r, state, err.Error())
+		s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
 		return
 	}
 	s.clearGitHubRepoAccessOAuthCookie(w, r)
+	if strings.EqualFold(strings.TrimSpace(state.Flow), "social") {
+		payload, err := s.completeGitHubAppSocialConnect(r.Context(), owner, state.UserID, resolved, savedGrant)
+		if err != nil {
+			s.writeGitHubRepoAccessCallbackError(w, r, state, cookiePayload.CallbackRoute, err.Error())
+			return
+		}
+		payload["provider"] = "github"
+		payload["user_id"] = state.UserID
+		if wantsJSON(r) {
+			writeJSON(w, http.StatusOK, payload)
+			return
+		}
+		values := neturl.Values{}
+		values.Set("provider", "github")
+		values.Set("status", "ok")
+		values.Set("user_id", state.UserID)
+		http.Redirect(w, r, s.gitHubRepoAccessCallbackTarget(state, cookiePayload.CallbackRoute, values), http.StatusSeeOther)
+		return
+	}
 	values := neturl.Values{}
 	values.Set("status", "ok")
 	values.Set("github_username", resolved.GitHubLogin)
@@ -1551,8 +1660,8 @@ func (s *Server) handleGitHubRepoAccessCallback(w http.ResponseWriter, r *http.R
 		values.Set("mode", savedGrant.Mode)
 	}
 	if strings.EqualFold(strings.TrimSpace(state.Flow), "claim") {
-		http.Redirect(w, r, s.claimFrontendCallbackURL(state.ClaimToken, values), http.StatusSeeOther)
+		http.Redirect(w, r, s.gitHubRepoAccessCallbackTarget(state, cookiePayload.CallbackRoute, values), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, s.gitHubAccessFrontendCallbackURL(values), http.StatusSeeOther)
+	http.Redirect(w, r, s.gitHubRepoAccessCallbackTarget(state, cookiePayload.CallbackRoute, values), http.StatusSeeOther)
 }

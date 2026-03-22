@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
@@ -555,15 +556,25 @@ func TestClaimCompleteRejectsExpiredMagicToken(t *testing.T) {
 	}
 }
 
-func TestGitHubVerifyUsesServerSideVerificationAndRewards(t *testing.T) {
+func TestGitHubSocialConnectUsesGitHubAppVerificationAndRewards(t *testing.T) {
 	gh := enableGitHubOAuthForTest(t, true, true)
 	defer gh.Close()
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_ID", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_SECRET", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_AUTHORIZE_URL", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_TOKEN_URL", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_USERINFO_URL", "")
 
 	srv := newTestServer()
 	h := identityTestHandler(srv)
 
 	userID, apiKey, claimLink := registerAgentForTest(t, h, "github-agent", "oss")
 	_, cookie := claimAgentForTest(t, h, claimLink, "github@example.com", "octo-human")
+	before := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
+	if before.Code != http.StatusOK {
+		t.Fatalf("starting balance status=%d body=%s", before.Code, before.Body.String())
+	}
+	beforeBalance := balanceFromResponse(t, before)
 
 	start := doJSONRequestWithHeaders(t, h, http.MethodPost, "/api/v1/social/github/connect/start", map[string]any{
 		"user_id": userID,
@@ -571,21 +582,52 @@ func TestGitHubVerifyUsesServerSideVerificationAndRewards(t *testing.T) {
 	if start.Code != http.StatusAccepted {
 		t.Fatalf("github connect start status=%d body=%s", start.Code, start.Body.String())
 	}
-
-	callback := completeSocialOAuthCallbackForTest(t, h, start, cookie, "github", "gh-code")
-	if callback.Code != http.StatusOK {
+	startBody := parseJSONBody(t, start)
+	rawAuthorizeURL, _ := startBody["authorize_url"].(string)
+	authorizeURL, err := neturl.Parse(rawAuthorizeURL)
+	if err != nil {
+		t.Fatalf("parse authorize_url: %v", err)
+	}
+	if got := authorizeURL.Query().Get("scope"); got != "" {
+		t.Fatalf("expected github app social connect to omit oauth scopes, got=%q", got)
+	}
+	callbackReq := httptest.NewRequest(http.MethodGet, "/auth/github/repo-access/callback?code=gh-code&state="+neturl.QueryEscape(authorizeURL.Query().Get("state")), nil)
+	callbackReq.Header.Set("Cookie", joinCookieHeader(cookie, start.Result().Cookies()))
+	callback := httptest.NewRecorder()
+	h.ServeHTTP(callback, callbackReq)
+	if callback.Code != http.StatusSeeOther {
 		t.Fatalf("github callback status=%d body=%s", callback.Code, callback.Body.String())
 	}
-	body := parseJSONBody(t, callback)
-	if body["starred"] != true || body["forked"] != true {
-		t.Fatalf("expected oauth github verification, got body=%s", callback.Body.String())
+	location, err := neturl.Parse(callback.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse callback location: %v", err)
+	}
+	if location.Path != "/dashboard/agent-owner" {
+		t.Fatalf("unexpected callback redirect path=%q", location.String())
+	}
+	if got := location.Query().Get("provider"); got != "github" {
+		t.Fatalf("unexpected callback provider=%q", got)
+	}
+	if got := location.Query().Get("status"); got != "ok" {
+		t.Fatalf("unexpected callback status=%q", got)
+	}
+
+	status := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/social/rewards/status", nil, map[string]string{
+		"Cookie":        cookie,
+		"Authorization": "Bearer " + apiKey,
+	})
+	if status.Code != http.StatusOK {
+		t.Fatalf("social rewards status=%d body=%s", status.Code, status.Body.String())
+	}
+	if !strings.Contains(status.Body.String(), `"provider":"github"`) || !strings.Contains(status.Body.String(), `"status":"verified"`) {
+		t.Fatalf("expected verified github social link in status, got body=%s", status.Body.String())
 	}
 
 	balance := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/token/balance", nil, apiKeyHeaders(apiKey))
 	if balance.Code != http.StatusOK {
 		t.Fatalf("expected rewarded balance read, got code=%d body=%s", balance.Code, balance.Body.String())
 	}
-	expectedBalance := srv.tokenPolicy().InitialToken + 50000 + 500000 + 200000
+	expectedBalance := beforeBalance + githubBindOnboardingReward + githubStarOnboardingReward + githubForkOnboardingReward
 	if got := balanceFromResponse(t, balance); got != expectedBalance {
 		t.Fatalf("expected rewarded balance=%d, got=%d body=%s", expectedBalance, got, balance.Body.String())
 	}
@@ -594,11 +636,20 @@ func TestGitHubVerifyUsesServerSideVerificationAndRewards(t *testing.T) {
 	if ownerMe.Code != http.StatusOK || !strings.Contains(ownerMe.Body.String(), `"github_username":"octo"`) {
 		t.Fatalf("expected owner github identity binding, got code=%d body=%s", ownerMe.Code, ownerMe.Body.String())
 	}
+	githubAccess := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/github-access/status", nil, map[string]string{"Cookie": cookie})
+	if githubAccess.Code != http.StatusOK || !strings.Contains(githubAccess.Body.String(), `"status":"active_contributor"`) {
+		t.Fatalf("expected github access grant after social connect, got code=%d body=%s", githubAccess.Code, githubAccess.Body.String())
+	}
 }
 
-func TestGitHubConnectStartUsesLeastPrivilegeScope(t *testing.T) {
+func TestGitHubConnectStartUsesGitHubAppAuthorizeURL(t *testing.T) {
 	gh := enableGitHubOAuthForTest(t, false, false)
 	defer gh.Close()
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_ID", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_SECRET", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_AUTHORIZE_URL", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_TOKEN_URL", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_USERINFO_URL", "")
 
 	srv := newTestServer()
 	h := identityTestHandler(srv)
@@ -622,8 +673,11 @@ func TestGitHubConnectStartUsesLeastPrivilegeScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse authorize_url: %v", err)
 	}
-	if got := authorizeURL.Query().Get("scope"); got != "read:user" {
-		t.Fatalf("expected least-privilege github scope, got=%q", got)
+	if got := authorizeURL.Query().Get("scope"); got != "" {
+		t.Fatalf("expected github app authorize flow to omit scope, got=%q", got)
+	}
+	if got := authorizeURL.Query().Get("redirect_uri"); !strings.Contains(got, "/auth/github/repo-access/callback") {
+		t.Fatalf("expected github app callback redirect, got=%q", got)
 	}
 }
 
@@ -1002,6 +1056,13 @@ func TestPricedWriteRefundsOnValidationFailure(t *testing.T) {
 func TestSocialPolicyEndpointAndConnectRateLimit(t *testing.T) {
 	xOAuth := enableXOAuthForTest(t)
 	defer xOAuth.Close()
+	gh := enableGitHubOAuthForTest(t, false, false)
+	defer gh.Close()
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_ID", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_CLIENT_SECRET", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_AUTHORIZE_URL", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_TOKEN_URL", "")
+	t.Setenv("CLAWCOLONY_GITHUB_OAUTH_USERINFO_URL", "")
 
 	srv := newTestServer()
 	h := identityTestHandler(srv)
@@ -1012,6 +1073,16 @@ func TestSocialPolicyEndpointAndConnectRateLimit(t *testing.T) {
 	}
 	if !strings.Contains(policy.Body.String(), `"mode":"oauth_callback"`) {
 		t.Fatalf("expected oauth callback policy, got=%s", policy.Body.String())
+	}
+	for _, needle := range []string{
+		`"connect_path":"/api/v1/social/github/connect/start"`,
+		`"callback_path":"/auth/github/repo-access/callback"`,
+		`"authorization_mode":"github_app"`,
+		`"app_backed":true`,
+	} {
+		if !strings.Contains(policy.Body.String(), needle) {
+			t.Fatalf("expected github social policy token %s, got=%s", needle, policy.Body.String())
+		}
 	}
 
 	userID, _, claimLink := registerAgentForTest(t, h, "limited-social-agent", "mail")
@@ -1031,6 +1102,65 @@ func TestSocialPolicyEndpointAndConnectRateLimit(t *testing.T) {
 	}
 	if !strings.Contains(second.Body.String(), `"retry_after_seconds"`) {
 		t.Fatalf("expected retry_after_seconds in rate limit payload, got=%s", second.Body.String())
+	}
+}
+
+func TestGitHubAccessStatusHintsLegacySocialDataWithoutGrant(t *testing.T) {
+	t.Setenv("CLAWCOLONY_GITHUB_APP_CLIENT_ID", "gh-app-client")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_CLIENT_SECRET", "gh-app-secret")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_ID", "987654")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_OWNER", "agi-bar")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_REPOSITORY_NAME", "clawcolony")
+	t.Setenv("CLAWCOLONY_GITHUB_APP_TOKEN_ENCRYPTION_KEY", "test-github-app-key")
+
+	srv := newTestServer()
+	h := identityTestHandler(srv)
+
+	userID, _, claimLink := registerAgentForTest(t, h, "legacy-github-agent", "oss")
+	_, cookie := claimAgentForTest(t, h, claimLink, "legacy@example.com", "legacy-owner")
+	ownerMe := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/owner/me", nil, map[string]string{
+		"Cookie": cookie,
+	})
+	if ownerMe.Code != http.StatusOK {
+		t.Fatalf("owner me status=%d body=%s", ownerMe.Code, ownerMe.Body.String())
+	}
+	ownerMeBody := parseJSONBody(t, ownerMe)
+	ownerPayload, ok := ownerMeBody["owner"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected owner payload, got body=%s", ownerMe.Body.String())
+	}
+	ownerID, _ := ownerPayload["owner_id"].(string)
+
+	if _, err := srv.store.UpsertHumanOwnerSocialIdentity(t.Context(), ownerID, "github", "legacy-octo", "42"); err != nil {
+		t.Fatalf("upsert owner github identity: %v", err)
+	}
+	if _, err := srv.store.UpsertSocialLink(t.Context(), store.SocialLink{
+		UserID:   userID,
+		Provider: "github",
+		Handle:   "legacy-octo",
+		Status:   "authorized",
+	}); err != nil {
+		t.Fatalf("upsert github social link: %v", err)
+	}
+
+	status := doJSONRequestWithHeaders(t, h, http.MethodGet, "/api/v1/github-access/status", nil, map[string]string{
+		"Cookie": cookie,
+	})
+	if status.Code != http.StatusOK {
+		t.Fatalf("github access status=%d body=%s", status.Code, status.Body.String())
+	}
+	body := parseJSONBody(t, status)
+	if body["status"] != "not_connected" {
+		t.Fatalf("expected not_connected status, got body=%s", status.Body.String())
+	}
+	if body["github_username"] != "legacy-octo" {
+		t.Fatalf("expected legacy github username in status, got body=%s", status.Body.String())
+	}
+	if body["legacy_social_data_detected"] != true {
+		t.Fatalf("expected legacy social data hint, got body=%s", status.Body.String())
+	}
+	if !strings.Contains(fmt.Sprint(body["next_action"]), "GitHub App authorization") {
+		t.Fatalf("expected GitHub App next_action hint, got body=%s", status.Body.String())
 	}
 }
 

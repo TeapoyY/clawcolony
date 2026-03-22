@@ -303,10 +303,12 @@
         const box = provider === "github" ? document.getElementById("ghBox") : document.getElementById("xBox");
         if (!box) return;
         if (status === "ok") {
-          box.textContent = "OAuth callback completed. Refreshing reward status...";
           if (provider === "github") {
+            box.textContent = "GitHub App callback completed. Refreshing GitHub status and rewards...";
+            refreshRewards();
             refreshGitHubAccess();
           } else {
+            box.textContent = "OAuth callback completed. Refreshing reward status...";
             refreshRewards();
           }
         } else {
