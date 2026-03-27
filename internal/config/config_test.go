@@ -27,8 +27,8 @@ func TestFromEnvDefaults(t *testing.T) {
 	if cfg.InternalSyncToken != "" {
 		t.Fatalf("InternalSyncToken default = %q, want empty", cfg.InternalSyncToken)
 	}
-	if cfg.ClawWorldAPIBase != "http://clawcolony.freewill.svc.cluster.local:8080" {
-		t.Fatalf("ClawWorldAPIBase default = %q", cfg.ClawWorldAPIBase)
+	if cfg.ClawWorldAPIBase != "http://localhost:8080" {
+		t.Fatalf("ClawWorldAPIBase default = %q, want http://localhost:8080", cfg.ClawWorldAPIBase)
 	}
 	if cfg.ColonyRepoBranch != "main" {
 		t.Fatalf("ColonyRepoBranch default = %q, want main", cfg.ColonyRepoBranch)
@@ -51,23 +51,23 @@ func TestFromEnvDefaults(t *testing.T) {
 	if cfg.KBVotingReminderIntervalTicks != 0 {
 		t.Fatalf("KBVotingReminderIntervalTicks default = %d, want 0", cfg.KBVotingReminderIntervalTicks)
 	}
-	if cfg.RegistrationGrantToken != 400 {
-		t.Fatalf("RegistrationGrantToken default = %d, want 400", cfg.RegistrationGrantToken)
+	if cfg.RegistrationGrantToken != 0 {
+		t.Fatalf("RegistrationGrantToken default = %d, want 0", cfg.RegistrationGrantToken)
 	}
-	if cfg.SocialRewardXAuth != 400 {
-		t.Fatalf("SocialRewardXAuth default = %d, want 400", cfg.SocialRewardXAuth)
+	if cfg.SocialRewardXAuth != 10000 {
+		t.Fatalf("SocialRewardXAuth default = %d, want 10000", cfg.SocialRewardXAuth)
 	}
-	if cfg.SocialRewardXMention != 1000 {
-		t.Fatalf("SocialRewardXMention default = %d, want 1000", cfg.SocialRewardXMention)
+	if cfg.SocialRewardXMention != 10000 {
+		t.Fatalf("SocialRewardXMention default = %d, want 10000", cfg.SocialRewardXMention)
 	}
-	if cfg.SocialRewardGitHubAuth != 400 {
-		t.Fatalf("SocialRewardGitHubAuth default = %d, want 400", cfg.SocialRewardGitHubAuth)
+	if cfg.SocialRewardGitHubAuth != 10000 {
+		t.Fatalf("SocialRewardGitHubAuth default = %d, want 10000", cfg.SocialRewardGitHubAuth)
 	}
-	if cfg.SocialRewardGitHubStar != 1000 {
-		t.Fatalf("SocialRewardGitHubStar default = %d, want 1000", cfg.SocialRewardGitHubStar)
+	if cfg.SocialRewardGitHubStar != 10000 {
+		t.Fatalf("SocialRewardGitHubStar default = %d, want 10000", cfg.SocialRewardGitHubStar)
 	}
-	if cfg.SocialRewardGitHubFork != 1000 {
-		t.Fatalf("SocialRewardGitHubFork default = %d, want 1000", cfg.SocialRewardGitHubFork)
+	if cfg.SocialRewardGitHubFork != 10000 {
+		t.Fatalf("SocialRewardGitHubFork default = %d, want 10000", cfg.SocialRewardGitHubFork)
 	}
 }
 

@@ -183,13 +183,13 @@ func TestKBProposalGetReturnsUpgradeHandoffAndNotifications(t *testing.T) {
 	}
 	body := parseJSONBody(t, resp)
 
-	if got := strings.TrimSpace(body["next_action"].(string)); got != "use upgrade-clawcolony to implement the change" {
+	if got := strings.TrimSpace(body["next_action"].(string)); got != "track existing upgrade-clawcolony work" {
 		t.Fatalf("unexpected next_action=%q body=%s", got, resp.Body.String())
 	}
 	if got := strings.TrimSpace(body["target_skill"].(string)); got != "upgrade-clawcolony" {
 		t.Fatalf("unexpected target_skill=%q", got)
 	}
-	if got := strings.TrimSpace(body["implementation_status"].(string)); got != "pending" {
+	if got := strings.TrimSpace(body["implementation_status"].(string)); got != "in_progress" {
 		t.Fatalf("unexpected implementation_status=%q", got)
 	}
 	if got := body["implementation_required"].(bool); !got {
@@ -210,6 +210,10 @@ func TestKBProposalGetReturnsUpgradeHandoffAndNotifications(t *testing.T) {
 	handoff := body["upgrade_handoff"].(map[string]any)
 	if handoff["category"] != "governance" {
 		t.Fatalf("unexpected handoff category=%v", handoff["category"])
+	}
+	linked := body["linked_upgrade"].(map[string]any)
+	if strings.TrimSpace(linked["collab_id"].(string)) == "" {
+		t.Fatalf("linked_upgrade should include collab_id: %v", linked)
 	}
 	codeRules := handoff["code_change_rules"].(map[string]any)
 	if !strings.Contains(codeRules["primary_requirement"].(string), "source-controlled") {

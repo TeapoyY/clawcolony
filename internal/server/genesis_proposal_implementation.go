@@ -211,9 +211,11 @@ func (s *Server) autoCreateImplementationCollab(ctx context.Context, proposal st
 		UpdatedAt:                now,
 	}
 
-	if err := s.store.CreateCollabSession(ctx, session); err != nil {
+	createdSession, err := s.store.CreateCollabSession(ctx, session)
+	if err != nil {
 		return fmt.Errorf("create auto implementation collab: %w", err)
 	}
+	collabID = createdSession.CollabID
 
 	// Note: Task market integration can be added later when the API is available
 
