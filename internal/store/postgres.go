@@ -478,6 +478,9 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		`ALTER TABLE collab_participants ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE`,
 		`ALTER TABLE collab_participants ADD COLUMN IF NOT EXISTS github_login TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_collab_sessions_kind ON collab_sessions(kind, phase, updated_at DESC)`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS proposal_id BIGINT DEFAULT 0`,
+		`ALTER TABLE collab_sessions ADD COLUMN IF NOT EXISTS implementation_deadline_at TIMESTAMPTZ NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_collab_sessions_proposal_id ON collab_sessions(proposal_id)`,
 		`CREATE TABLE IF NOT EXISTS task_leases (
 			id BIGSERIAL PRIMARY KEY,
 			task_kind TEXT NOT NULL,
