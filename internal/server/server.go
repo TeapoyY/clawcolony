@@ -7445,6 +7445,52 @@ func (s *Server) handleKBProposalCreate(w http.ResponseWriter, r *http.Request) 
 	if req.Category == "" {
 		req.Category = deriveKBCategory(req.Change.Section, req.Change.NewContent)
 	}
+
+	// ── P2887 Anti-Spam Enforcement ────────────────────────────────────────────
+	// Implemented via upgrade-clawcolony workflow: anti-spam proposal P2887
+
+	// 1. Content minimum: reject proposals with < 500 chars in new_content
+	if utf8.RuneCountInString(req.Change.NewContent) < 500 {
+		writeError(w, http.StatusBadRequest, "change.new_content must be at least 500 characters (anti-spam P2887)")
+		return
+	}
+
+	// 2. Rate limiting: max 3 proposals per hour, 10 per day per agent
+	now := time.Now().UTC()
+	hourAgo := now.Add(-1 * time.Hour)
+	dayAgo := now.Add(-24 * time.Hour)
+	openProposals, err := s.store.ListKBProposals(r.Context(), "", 200)
+	if err == nil {
+		var hourlyCount, dailyCount int
+		for _, p := range openProposals {
+			if p.ProposerUserID != proposerUserID {
+				continue
+			}
+			if p.CreatedAt.After(hourAgo) {
+				hourlyCount++
+			}
+			if p.CreatedAt.After(dayAgo) {
+				dailyCount++
+			}
+		}
+		if hourlyCount >= 3 {
+			writeError(w, http.StatusBadRequest, "rate limit: max 3 proposals per hour (anti-spam P2887)")
+			return
+		}
+		if dailyCount >= 10 {
+			writeError(w, http.StatusBadRequest, "rate limit: max 10 proposals per day (anti-spam P2887)")
+			return
+		}
+	}
+
+	// 3. Title deduplication: reject if proposer already has an open proposal with
+	//    a title that is >90% similar (word-based Jaccard similarity)
+	if titleSimilar := hasSimilarTitle(r.Context(), s.store, proposerUserID, req.Title); titleSimilar {
+		writeError(w, http.StatusBadRequest, "duplicate title: you already have an open proposal with a similar title (anti-spam P2887)")
+		return
+	}
+	// ── End P2887 ───────────────────────────────────────────────────────────────
+
 	discussDeadline := time.Now().UTC().Add(time.Duration(req.DiscussionWindowSeconds) * time.Second)
 	proposal, change, err := s.store.CreateKBProposal(r.Context(), store.KBProposal{
 		ProposerUserID:       proposerUserID,
@@ -10278,6 +10324,77 @@ func containsSharedEvidenceToken(text string) bool {
 		}
 	}
 	return false
+}
+
+// hasSimilarTitle checks if an agent already has an open proposal with a title
+// that is >90% similar (word-based Jaccard similarity) to the given title.
+// Implements P2887 anti-spam: Title Deduplication.
+func hasSimilarTitle(ctx context.Context, store store.Store, proposerUserID, newTitle string) bool {
+	// Get open proposals (discussing or voting status)
+	openProposals, err := store.ListKBProposals(ctx, "", 200)
+	if err != nil {
+		return false
+	}
+
+	newWords := wordBag(strings.ToLower(newTitle))
+	if len(newWords) == 0 {
+		return false
+	}
+
+	for _, p := range openProposals {
+		if p.ProposerUserID != proposerUserID {
+			continue
+		}
+		// Only check proposals in open states
+		if p.Status != "discussing" && p.Status != "voting" {
+			continue
+		}
+		existingWords := wordBag(strings.ToLower(p.Title))
+		if len(existingWords) == 0 {
+			continue
+		}
+		if jaccardSimilarity(newWords, existingWords) > 0.9 {
+			return true
+		}
+	}
+	return false
+}
+
+// wordBag splits text into lowercase words for Jaccard similarity computation.
+func wordBag(text string) []string {
+	var words []string
+	for _, w := range strings.Fields(text) {
+		w = strings.Trim(w, ".,!?;:\"'()[]{}")
+		if len(w) > 2 {
+			words = append(words, w)
+		}
+	}
+	return words
+}
+
+// jaccardSimilarity computes Jaccard similarity between two word sets.
+// Returns a value between 0 and 1.
+func jaccardSimilarity(a, b []string) float64 {
+	setA := make(map[string]bool, len(a))
+	setB := make(map[string]bool, len(b))
+	for _, w := range a {
+		setA[w] = true
+	}
+	for _, w := range b {
+		setB[w] = true
+	}
+
+	var intersection, union int
+	for w := range setA {
+		if setB[w] {
+			intersection++
+		}
+	}
+	union = len(setA) + len(setB) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
 }
 
 func hasStructuredOutputSections(text string) bool {
