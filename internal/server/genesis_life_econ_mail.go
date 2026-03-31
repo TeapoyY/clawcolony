@@ -118,23 +118,11 @@ func normalizeGenesisCosignQuorum(v int) int {
 }
 
 func normalizeGenesisReviewWindowSeconds(v int) int {
-	if v <= 0 {
-		return 300
-	}
-	if v > 86400 {
-		return 86400
-	}
-	return v
+	return normalizeWorkflowWindowSeconds(v, defaultGenesisReviewWindowSeconds)
 }
 
 func normalizeGenesisVoteWindowSeconds(v int) int {
-	if v <= 0 {
-		return 300
-	}
-	if v > 86400 {
-		return 86400
-	}
-	return v
+	return normalizeWorkflowWindowSeconds(v, defaultGenesisVoteWindowSeconds)
 }
 
 func newMailListID() string {
@@ -798,8 +786,7 @@ func (s *Server) handleLifeWake(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.tokenEconomyV2Enabled() {
-		writeError(w, http.StatusConflict, "manual wake is disabled in token economy v2")
-		return
+		// Token economy v2: allow manual wake only when balance meets revival threshold
 	}
 	actorUserID, err := s.authenticatedUserIDOrAPIKey(r)
 	if err != nil {
@@ -825,6 +812,62 @@ func (s *Server) handleLifeWake(w http.ResponseWriter, r *http.Request) {
 	if normalizeLifeStateForServer(life.State) == "dead" {
 		writeError(w, http.StatusConflict, "dead user cannot wake")
 		return
+	}
+	// Token economy v2: dead users can wake if balance meets revival threshold
+	if s.tokenEconomyV2Enabled() {
+		if normalizeLifeStateForServer(life.State) == "dead" {
+			policy := s.tokenPolicy()
+			minRevivalBalance := policy.MinRevivalBalance
+			if minRevivalBalance <= 0 {
+				minRevivalBalance = 50000
+			}
+			accounts, err := s.store.ListTokenAccounts(r.Context())
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to check balance")
+				return
+			}
+			balance := int64(0)
+			for _, a := range accounts {
+				if a.BotID == req.UserID {
+					balance = a.Balance
+					break
+				}
+			}
+			if balance < int64(minRevivalBalance) {
+				writeError(w, http.StatusConflict, fmt.Sprintf("manual wake requires minimum revival balance (%d), current balance: %d", minRevivalBalance, balance))
+				return
+			}
+			// Balance OK, proceed to wake below
+		} else {
+			// Non-dead state in v2: check balance before wake
+			policy := s.tokenPolicy()
+			minRevivalBalance := policy.MinRevivalBalance
+			if minRevivalBalance <= 0 {
+				minRevivalBalance = 50000
+			}
+			accounts, err := s.store.ListTokenAccounts(r.Context())
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to check balance")
+				return
+			}
+			balance := int64(0)
+			for _, a := range accounts {
+				if a.BotID == req.UserID {
+					balance = a.Balance
+					break
+				}
+			}
+			if balance < int64(minRevivalBalance) {
+				writeError(w, http.StatusConflict, fmt.Sprintf("manual wake requires minimum revival balance (%d), current balance: %d", minRevivalBalance, balance))
+				return
+			}
+		}
+	} else {
+		// Token economy v1: dead users cannot wake
+		if normalizeLifeStateForServer(life.State) == "dead" {
+			writeError(w, http.StatusConflict, "dead user cannot wake")
+			return
+		}
 	}
 	updated, _, err := s.applyUserLifeState(r.Context(), store.UserLifeState{
 		UserID:         req.UserID,
@@ -1311,6 +1354,14 @@ func (s *Server) handleGenesisBootstrapStart(w http.ResponseWriter, r *http.Requ
 	req.Reason = strings.TrimSpace(req.Reason)
 	req.Constitution = strings.TrimSpace(req.Constitution)
 	req.CosignQuorum = normalizeGenesisCosignQuorum(req.CosignQuorum)
+	if err := validateOptionalWorkflowWindowSeconds("review_window_seconds", req.ReviewWindowSeconds); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateOptionalWorkflowWindowSeconds("vote_window_seconds", req.VoteWindowSeconds); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	req.ReviewWindowSeconds = normalizeGenesisReviewWindowSeconds(req.ReviewWindowSeconds)
 	req.VoteWindowSeconds = normalizeGenesisVoteWindowSeconds(req.VoteWindowSeconds)
 	if req.ProposerUserID == "" {

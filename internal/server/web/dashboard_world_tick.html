@@ -167,7 +167,7 @@
         <input id="alertScanLimit" value="500" style="width:120px" />
       </label>
       <label>scheduler cost cooldown(s):
-        <input id="alertCooldownSec" value="600" style="width:130px" />
+        <input id="alertCooldownSec" value="1800" style="width:130px" />
       </label>
       <label>autonomy ticks:
         <input id="schedAutonomyTicks" value="0" style="width:130px" />
@@ -526,10 +526,16 @@
         }
       }
       const MAX_SCHEDULER_INTERVAL_TICKS = 10080;
-      const MIN_SCHEDULER_COOLDOWN_SECONDS = 30;
+      const MIN_SCHEDULER_COOLDOWN_SECONDS = 1800;
       const MAX_SCHEDULER_COOLDOWN_SECONDS = 86400;
+      let minMailReminderIntervalTicks = 30;
+      function syncMinMailReminderIntervalTicks(tickIntervalSec){
+        const sec = Number(tickIntervalSec);
+        const normalizedSec = Number.isFinite(sec) && sec > 0 ? sec : 60;
+        minMailReminderIntervalTicks = Math.max(1, Math.ceil((30 * 60) / normalizedSec));
+      }
       function parseIntervalTicksInput(id, name){
-        return parseIntInput(id, name, 0, MAX_SCHEDULER_INTERVAL_TICKS, true);
+        return parseIntInput(id, name, minMailReminderIntervalTicks, MAX_SCHEDULER_INTERVAL_TICKS, true);
       }
       function parseIntInput(id, name, min, max, allowZero){
         const raw = String(document.getElementById(id).value || "").trim();
@@ -554,7 +560,7 @@
           document.getElementById("schedKBEnrollTicks").value = String(it.kb_enrollment_reminder_interval_ticks ?? 0);
           document.getElementById("schedKBVoteTicks").value = String(it.kb_voting_reminder_interval_ticks ?? 0);
           document.getElementById("schedLowTokenCooldownSec").value = String(it.low_token_alert_cooldown_seconds ?? 0);
-          document.getElementById("alertCooldownSec").value = String(it.cost_alert_notify_cooldown_seconds ?? 600);
+          document.getElementById("alertCooldownSec").value = String(it.cost_alert_notify_cooldown_seconds ?? 1800);
           state.textContent = `scheduler source=${d.source || "compat"} updated_at=${d.updated_at || ""}`;
         }catch(e){
           state.textContent = "scheduler load failed: " + (e.message || e);
@@ -655,6 +661,7 @@
             j("/api/v1/world/tick/status"),
             j(`/api/v1/world/tick/history?limit=${limit}`)
           ]);
+          syncMinMailReminderIntervalTicks(status.tick_interval_sec || 60);
           document.getElementById("replaySourceTickID").value = String(status.tick_id || 0);
           const stepTickID = encodeURIComponent(String(status.tick_id || 0));
           const [steps, chainVerify, lifeStates, cost, summary, toolAudit, alerts, notifyLog, evolution, evolutionAlerts, evolutionNotifyLog] = await Promise.all([
