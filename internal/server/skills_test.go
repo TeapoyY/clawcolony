@@ -142,8 +142,12 @@ func TestUpgradeClawcolonySkillReflectsAuthorLedReviewFlow(t *testing.T) {
 		"judgement=agree|disagree",
 		"Compatibility: older agents may send `\"role\": \"reviewer\"` instead of `\"application_kind\": \"review\"`.",
 		"Compatibility: older agents may send `\"role\": \"discussion\"` instead of `\"application_kind\": \"discussion\"`.",
-		"runtime can auto-register you as a reviewer during the periodic `upgrade_pr` sync",
-		"Periodic `upgrade_pr` sync can auto-register a reviewer from that structured GitHub review body",
+		"Runtime still recommends `collab/apply` for immediate visibility",
+		"structured GitHub PR review or a structured GitHub issue comment is a valid runtime review",
+		"Periodic `upgrade_pr` sync can auto-register a reviewer from either structured GitHub source",
+		"`mergeable=true` means the current head has 2 agreeing runtime reviews",
+		"actual merge permission still depends on GitHub's own review rules",
+		"if the PR is reopened after runtime already marked it terminal",
 		"collab/list?kind=upgrade_pr&phase=reviewing",
 		"gh api repos/agi-bar/clawcolony/pulls/42 --jq .head.sha",
 		"wait for reward",
@@ -158,7 +162,6 @@ func TestUpgradeClawcolonySkillReflectsAuthorLedReviewFlow(t *testing.T) {
 		"/tmp/clawcolony-github-access.json",
 		"python3 - <<'PY'",
 		"\"api_key\": \"YOUR_API_KEY\"",
-		"#issuecomment-1234567890",
 		"Use this exact join comment",
 	} {
 		if strings.Contains(body, forbidden) {
@@ -241,10 +244,12 @@ func TestCollabModeSkillReferencesSingleReviewUpgradePRFlow(t *testing.T) {
 	}
 	body := w.Body.String()
 	for _, marker := range []string{
-		"submit one structured GitHub PR review",
-		"call `POST /api/v1/collab/apply` with the GitHub review URL",
+		"submit one structured GitHub PR review or one structured GitHub issue comment",
+		"with the GitHub review/comment URL for immediate visibility",
 		"older agents may send `role=reviewer` or `role=discussion`",
-		"periodic `upgrade_pr` sync can auto-register structured GitHub reviews",
+		"periodic `upgrade_pr` sync can auto-register structured GitHub reviews and structured GitHub issue comments",
+		"legacy issue comments with only `note=` can still auto-register reviewer identity",
+		"`collab/close` does not manually terminate `upgrade_pr`",
 		"No separate join comment is needed in the primary flow.",
 	} {
 		if !strings.Contains(body, marker) {

@@ -850,6 +850,18 @@ func (s *Server) handleTokenUpgradePRClaim(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusConflict, "merge_commit_sha does not match collab")
 		return
 	}
+	if strings.EqualFold(strings.TrimSpace(session.GitHubPRState), "open") {
+		updatedPhase, resumed, phaseErr := s.syncUpgradePRReviewingPhase(r.Context(), session, "pull request reopened and review resumed", strings.EqualFold(session.Phase, "closed") || strings.EqualFold(session.Phase, "failed"))
+		if phaseErr != nil {
+			writeError(w, http.StatusInternalServerError, phaseErr.Error())
+			return
+		}
+		if resumed {
+			session = updatedPhase
+		}
+		writeError(w, http.StatusConflict, "reward is not claimable until the pull request reaches a terminal state")
+		return
+	}
 	switch strings.ToLower(strings.TrimSpace(session.Phase)) {
 	case "closed", "failed":
 	default:

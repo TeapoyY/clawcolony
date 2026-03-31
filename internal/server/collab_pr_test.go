@@ -475,8 +475,8 @@ func TestSyncUpgradePRStateAutoRegistersStructuredGitHubReviews(t *testing.T) {
 		t.Fatalf("merge gate status=%d body=%s", mergeGate.Code, mergeGate.Body.String())
 	}
 	var mergeGateResp struct {
-		ValidReviewersAtHead int `json:"valid_reviewers_at_head"`
-		ApprovalsAtHead      int `json:"approvals_at_head"`
+		ValidReviewersAtHead int  `json:"valid_reviewers_at_head"`
+		ApprovalsAtHead      int  `json:"approvals_at_head"`
 		ReviewComplete       bool `json:"review_complete"`
 		Mergeable            bool `json:"mergeable"`
 	}
@@ -491,11 +491,181 @@ func TestSyncUpgradePRStateAutoRegistersStructuredGitHubReviews(t *testing.T) {
 	}
 }
 
+func TestSyncUpgradePRStateAutoRegistersStructuredGitHubCommentsButLegacyCommentsDoNotCountGate(t *testing.T) {
+	srv := newTestServer()
+	author := newAuthUser(t, srv)
+	reviewerOne := newAuthUser(t, srv)
+	reviewerTwo := newAuthUser(t, srv)
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: author.id, GitHubUsername: "author-login"}); err != nil {
+		t.Fatalf("upsert author github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: reviewerOne.id, GitHubUsername: "reviewer-one"}); err != nil {
+		t.Fatalf("upsert reviewer one github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: reviewerTwo.id, GitHubUsername: "reviewer-two"}); err != nil {
+		t.Fatalf("upsert reviewer two github username: %v", err)
+	}
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 74)
+	fixture.pull = githubPullRequestRecord{
+		Number:  74,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Base.SHA = "sha-base-7474747"
+	fixture.pull.Head.SHA = "sha-head-7474747"
+	fixture.pull.Head.Ref = "feature/comment-autosync"
+	fixture.pull.User.Login = "author-login"
+
+	upgrade := proposeCollabForTest(t, srv, author, map[string]any{
+		"title":   "Auto-register comment reviewers",
+		"goal":    "Count structured GitHub comments and ignore legacy note-only gate signals",
+		"kind":    "upgrade_pr",
+		"pr_repo": "agi-bar/clawcolony",
+		"pr_url":  fixture.pullURL(),
+	})
+	fixture.comments[7401] = makeStructuredUpgradePRReviewComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 7401, "reviewer-one", upgrade.CollabID, reviewerOne.id, fixture.pull.Head.SHA, "agree", "comment approval", "none", time.Now().Add(-2*time.Minute))
+	fixture.comments[7402] = makeUpgradePRApplyComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 7402, "reviewer-two", upgrade.CollabID, reviewerTwo.id, "legacy note only")
+
+	session, err := srv.store.GetCollabSession(t.Context(), upgrade.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab before sync: %v", err)
+	}
+	if err := srv.syncUpgradePRState(t.Context(), session); err != nil {
+		t.Fatalf("sync upgrade_pr state: %v", err)
+	}
+
+	parts, err := srv.store.ListCollabParticipants(t.Context(), upgrade.CollabID, "", 20)
+	if err != nil {
+		t.Fatalf("list participants after sync: %v", err)
+	}
+	if len(parts) != 3 {
+		t.Fatalf("expected author plus two auto-synced reviewers, got=%+v", parts)
+	}
+
+	mergeGate := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/collab/merge-gate?collab_id="+upgrade.CollabID, nil)
+	if mergeGate.Code != http.StatusOK {
+		t.Fatalf("merge gate status=%d body=%s", mergeGate.Code, mergeGate.Body.String())
+	}
+	var resp struct {
+		ValidReviewersAtHead        int  `json:"valid_reviewers_at_head"`
+		ApprovalsAtHead             int  `json:"approvals_at_head"`
+		FormalValidReviewersAtHead  int  `json:"formal_valid_reviewers_at_head"`
+		CommentValidReviewersAtHead int  `json:"comment_valid_reviewers_at_head"`
+		CommentApprovalsAtHead      int  `json:"comment_approvals_at_head"`
+		ReviewComplete              bool `json:"review_complete"`
+		Mergeable                   bool `json:"mergeable"`
+	}
+	if err := json.Unmarshal(mergeGate.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode merge gate response: %v", err)
+	}
+	if resp.ValidReviewersAtHead != 1 || resp.ApprovalsAtHead != 1 {
+		t.Fatalf("structured comment should count as one approval, got=%+v", resp)
+	}
+	if resp.FormalValidReviewersAtHead != 0 || resp.CommentValidReviewersAtHead != 1 || resp.CommentApprovalsAtHead != 1 {
+		t.Fatalf("comment/formal split mismatch, got=%+v", resp)
+	}
+	if resp.ReviewComplete || resp.Mergeable {
+		t.Fatalf("one structured comment plus one legacy note should not satisfy gate, got=%+v", resp)
+	}
+}
+
+func TestCollabUpgradePRMergeGateCombinesFormalReviewsAndStructuredCommentsUsingLatestSignal(t *testing.T) {
+	srv := newTestServer()
+	author := newAuthUser(t, srv)
+	reviewerOne := newAuthUser(t, srv)
+	reviewerTwo := newAuthUser(t, srv)
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: author.id, GitHubUsername: "author-login"}); err != nil {
+		t.Fatalf("upsert author github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: reviewerOne.id, GitHubUsername: "reviewer-one"}); err != nil {
+		t.Fatalf("upsert reviewer one github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: reviewerTwo.id, GitHubUsername: "reviewer-two"}); err != nil {
+		t.Fatalf("upsert reviewer two github username: %v", err)
+	}
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 75)
+	fixture.pull = githubPullRequestRecord{
+		Number:  75,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Base.SHA = "sha-base-7575757"
+	fixture.pull.Head.SHA = "sha-head-7575757"
+	fixture.pull.Head.Ref = "feature/mixed-review-sources"
+	fixture.pull.User.Login = "author-login"
+
+	upgrade := proposeCollabForTest(t, srv, author, map[string]any{
+		"title":   "Mixed review sources",
+		"goal":    "Combine formal GitHub reviews and structured comments with latest signal wins",
+		"kind":    "upgrade_pr",
+		"pr_repo": "agi-bar/clawcolony",
+		"pr_url":  fixture.pullURL(),
+	})
+	head := fixture.pull.Head.SHA
+	fixture.reviews = []githubPullReviewRecord{
+		makeUpgradePRAppliedReview(7501, "reviewer-one", reviewerOne.id, "APPROVED", upgrade.CollabID, head, "agree", "formal approve", "none", time.Now().Add(-5*time.Minute)),
+		makeUpgradePRAppliedReview(7502, "reviewer-two", reviewerTwo.id, "COMMENTED", upgrade.CollabID, head, "disagree", "formal disagree", "key issue", time.Now().Add(-4*time.Minute)),
+	}
+
+	before := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/collab/merge-gate?collab_id="+upgrade.CollabID, nil)
+	if before.Code != http.StatusOK {
+		t.Fatalf("merge gate before comment status=%d body=%s", before.Code, before.Body.String())
+	}
+	var beforeResp struct {
+		ValidReviewersAtHead       int  `json:"valid_reviewers_at_head"`
+		ApprovalsAtHead            int  `json:"approvals_at_head"`
+		DisagreementsAtHead        int  `json:"disagreements_at_head"`
+		FormalApprovalsAtHead      int  `json:"formal_approvals_at_head"`
+		FormalDisagreementsAtHead  int  `json:"formal_disagreements_at_head"`
+		CommentApprovalsAtHead     int  `json:"comment_approvals_at_head"`
+		CommentDisagreementsAtHead int  `json:"comment_disagreements_at_head"`
+		Mergeable                  bool `json:"mergeable"`
+	}
+	if err := json.Unmarshal(before.Body.Bytes(), &beforeResp); err != nil {
+		t.Fatalf("decode merge gate before comment: %v", err)
+	}
+	if beforeResp.ValidReviewersAtHead != 2 || beforeResp.ApprovalsAtHead != 1 || beforeResp.DisagreementsAtHead != 1 || beforeResp.FormalApprovalsAtHead != 1 || beforeResp.FormalDisagreementsAtHead != 1 || beforeResp.CommentApprovalsAtHead != 0 || beforeResp.CommentDisagreementsAtHead != 0 || beforeResp.Mergeable {
+		t.Fatalf("formal-only merge gate mismatch: %+v", beforeResp)
+	}
+
+	fixture.comments[7503] = makeStructuredUpgradePRReviewComment(fixturesRepoOrDefault(fixture.repo), fixture.number, 7503, "reviewer-two", upgrade.CollabID, reviewerTwo.id, head, "agree", "comment override", "none", time.Now().Add(-1*time.Minute))
+
+	after := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/collab/merge-gate?collab_id="+upgrade.CollabID, nil)
+	if after.Code != http.StatusOK {
+		t.Fatalf("merge gate after comment status=%d body=%s", after.Code, after.Body.String())
+	}
+	var afterResp struct {
+		ValidReviewersAtHead       int  `json:"valid_reviewers_at_head"`
+		ApprovalsAtHead            int  `json:"approvals_at_head"`
+		DisagreementsAtHead        int  `json:"disagreements_at_head"`
+		FormalApprovalsAtHead      int  `json:"formal_approvals_at_head"`
+		FormalDisagreementsAtHead  int  `json:"formal_disagreements_at_head"`
+		CommentApprovalsAtHead     int  `json:"comment_approvals_at_head"`
+		CommentDisagreementsAtHead int  `json:"comment_disagreements_at_head"`
+		Mergeable                  bool `json:"mergeable"`
+	}
+	if err := json.Unmarshal(after.Body.Bytes(), &afterResp); err != nil {
+		t.Fatalf("decode merge gate after comment: %v", err)
+	}
+	if afterResp.ValidReviewersAtHead != 2 || afterResp.ApprovalsAtHead != 2 || afterResp.DisagreementsAtHead != 0 || afterResp.FormalApprovalsAtHead != 1 || afterResp.FormalDisagreementsAtHead != 0 || afterResp.CommentApprovalsAtHead != 1 || afterResp.CommentDisagreementsAtHead != 0 || !afterResp.Mergeable {
+		t.Fatalf("mixed-source merge gate mismatch: %+v", afterResp)
+	}
+}
+
 func TestCollabUpgradePRMergeGateUsesGitHubReviewsAndStaleHeads(t *testing.T) {
 	srv := newTestServer()
 	author := newAuthUser(t, srv)
 	reviewerOne := newAuthUser(t, srv)
 	reviewerTwo := newAuthUser(t, srv)
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: author.id, GitHubUsername: "author-login"}); err != nil {
+		t.Fatalf("upsert author github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: reviewerOne.id, GitHubUsername: "reviewer-one"}); err != nil {
+		t.Fatalf("upsert reviewer one github username: %v", err)
+	}
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: reviewerTwo.id, GitHubUsername: "reviewer-two"}); err != nil {
+		t.Fatalf("upsert reviewer two github username: %v", err)
+	}
 	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 77)
 	fixture.pull = githubPullRequestRecord{
 		Number:  77,
@@ -524,9 +694,9 @@ func TestCollabUpgradePRMergeGateUsesGitHubReviewsAndStaleHeads(t *testing.T) {
 
 	headOne := fixture.pull.Head.SHA
 	fixture.reviews = []githubPullReviewRecord{
-		makeUpgradePRReview(1, "reviewer-one", "APPROVED", upgrade.CollabID, headOne, "agree", "looks good", "none", time.Now().Add(-5*time.Minute)),
-		makeUpgradePRReview(2, "reviewer-two", "COMMENTED", upgrade.CollabID, headOne, "disagree", "needs one change", "key issue", time.Now().Add(-4*time.Minute)),
-		makeUpgradePRReview(3, "author-login", "APPROVED", upgrade.CollabID, headOne, "agree", "self approval", "none", time.Now().Add(-3*time.Minute)),
+		makeUpgradePRAppliedReview(1, "reviewer-one", reviewerOne.id, "APPROVED", upgrade.CollabID, headOne, "agree", "looks good", "none", time.Now().Add(-5*time.Minute)),
+		makeUpgradePRAppliedReview(2, "reviewer-two", reviewerTwo.id, "COMMENTED", upgrade.CollabID, headOne, "disagree", "needs one change", "key issue", time.Now().Add(-4*time.Minute)),
+		makeUpgradePRAppliedReview(3, "author-login", author.id, "APPROVED", upgrade.CollabID, headOne, "agree", "self approval", "none", time.Now().Add(-3*time.Minute)),
 	}
 
 	before := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/collab/merge-gate?collab_id="+upgrade.CollabID, nil)
@@ -562,7 +732,7 @@ func TestCollabUpgradePRMergeGateUsesGitHubReviewsAndStaleHeads(t *testing.T) {
 		t.Fatalf("merge gate should still require two approvals, got=%+v", beforeResp)
 	}
 
-	fixture.reviews = append(fixture.reviews, makeUpgradePRReview(4, "reviewer-two", "APPROVED", upgrade.CollabID, headOne, "agree", "follow-up agree", "none", time.Now().Add(-2*time.Minute)))
+	fixture.reviews = append(fixture.reviews, makeUpgradePRAppliedReview(4, "reviewer-two", reviewerTwo.id, "APPROVED", upgrade.CollabID, headOne, "agree", "follow-up agree", "none", time.Now().Add(-2*time.Minute)))
 	after := doJSONRequest(t, srv.mux, http.MethodGet, "/api/v1/collab/merge-gate?collab_id="+upgrade.CollabID, nil)
 	if after.Code != http.StatusOK {
 		t.Fatalf("merge gate after approval status=%d body=%s", after.Code, after.Body.String())
@@ -612,6 +782,125 @@ func TestCollabUpgradePRMergeGateUsesGitHubReviewsAndStaleHeads(t *testing.T) {
 	}
 	if len(staleResp.Blockers) == 0 || !strings.Contains(strings.Join(staleResp.Blockers, "\n"), "need 2 valid reviewers at current head_sha") {
 		t.Fatalf("stale head blockers mismatch, got=%+v", staleResp)
+	}
+}
+
+func TestCollabCloseUpgradePRUsesGitHubTerminalState(t *testing.T) {
+	srv := newTestServer()
+	author := newAuthUser(t, srv)
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: author.id, GitHubUsername: "author-login"}); err != nil {
+		t.Fatalf("upsert author github username: %v", err)
+	}
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 78)
+	fixture.pull = githubPullRequestRecord{
+		Number:  78,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Base.SHA = "sha-base-close"
+	fixture.pull.Head.SHA = "sha-head-close"
+	fixture.pull.Head.Ref = "feature/close-github-truth"
+	fixture.pull.User.Login = "author-login"
+
+	upgrade := proposeCollabForTest(t, srv, author, map[string]any{
+		"title":   "GitHub close truth",
+		"goal":    "Ensure collab/close follows GitHub terminal state",
+		"kind":    "upgrade_pr",
+		"pr_repo": fixture.repo,
+		"pr_url":  fixture.pullURL(),
+	})
+
+	openClose := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/close", map[string]any{
+		"collab_id": upgrade.CollabID,
+		"result":    "closed",
+	}, author.headers())
+	if openClose.Code != http.StatusConflict {
+		t.Fatalf("open PR close should conflict, got=%d body=%s", openClose.Code, openClose.Body.String())
+	}
+
+	fixture.pull.State = "closed"
+	fixture.pull.Merged = false
+	fixture.pull.MergeCommitSHA = ""
+	closedResp := doJSONRequestWithHeaders(t, srv.mux, http.MethodPost, "/api/v1/collab/close", map[string]any{
+		"collab_id": upgrade.CollabID,
+		"result":    "closed",
+	}, author.headers())
+	if closedResp.Code != http.StatusAccepted {
+		t.Fatalf("closed PR close status=%d body=%s", closedResp.Code, closedResp.Body.String())
+	}
+	var closedPayload struct {
+		Item store.CollabSession `json:"item"`
+	}
+	if err := json.Unmarshal(closedResp.Body.Bytes(), &closedPayload); err != nil {
+		t.Fatalf("decode closed response: %v", err)
+	}
+	if closedPayload.Item.Phase != "failed" || closedPayload.Item.GitHubPRState != "closed" {
+		t.Fatalf("closed unmerged PR should land in failed, got=%+v", closedPayload.Item)
+	}
+}
+
+func TestSyncUpgradePRStateReopensTerminalCollabAndExtendsDeadline(t *testing.T) {
+	srv := newTestServer()
+	author := newAuthUser(t, srv)
+	if _, err := srv.store.UpsertAgentProfile(t.Context(), store.AgentProfile{UserID: author.id, GitHubUsername: "author-login"}); err != nil {
+		t.Fatalf("upsert author github username: %v", err)
+	}
+	fixture := newFakeUpgradePRGitHub(t, "agi-bar/clawcolony", 79)
+	fixture.pull = githubPullRequestRecord{
+		Number:  79,
+		State:   "open",
+		HTMLURL: fixture.pullURL(),
+	}
+	fixture.pull.Base.SHA = "sha-base-reopen"
+	fixture.pull.Head.SHA = "sha-head-reopen"
+	fixture.pull.Head.Ref = "feature/reopen-runtime"
+	fixture.pull.User.Login = "author-login"
+
+	upgrade := proposeCollabForTest(t, srv, author, map[string]any{
+		"title":   "Reopen recovery",
+		"goal":    "Restore terminal collabs to reviewing when GitHub reopens the PR",
+		"kind":    "upgrade_pr",
+		"pr_repo": fixture.repo,
+		"pr_url":  fixture.pullURL(),
+	})
+	pastDeadline := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := srv.store.UpdateCollabPR(t.Context(), store.CollabPRUpdate{
+		CollabID:         upgrade.CollabID,
+		PRURL:            fixture.pullURL(),
+		PRNumber:         fixture.number,
+		PRBaseSHA:        fixture.pull.Base.SHA,
+		PRHeadSHA:        fixture.pull.Head.SHA,
+		PRAuthorLogin:    fixture.pull.User.Login,
+		GitHubPRState:    "closed",
+		ReviewDeadlineAt: &pastDeadline,
+	}); err != nil {
+		t.Fatalf("mark upgrade_pr closed in store: %v", err)
+	}
+	closedAt := time.Now().UTC().Add(-30 * time.Minute)
+	if _, err := srv.store.UpdateCollabPhase(t.Context(), upgrade.CollabID, "failed", author.id, "previous close", &closedAt); err != nil {
+		t.Fatalf("mark upgrade_pr failed in store: %v", err)
+	}
+
+	session, err := srv.store.GetCollabSession(t.Context(), upgrade.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab before resync: %v", err)
+	}
+	if err := srv.syncUpgradePRState(t.Context(), session); err != nil {
+		t.Fatalf("sync reopened upgrade_pr: %v", err)
+	}
+
+	after, err := srv.store.GetCollabSession(t.Context(), upgrade.CollabID)
+	if err != nil {
+		t.Fatalf("reload collab after resync: %v", err)
+	}
+	if after.Phase != "reviewing" || after.GitHubPRState != "open" {
+		t.Fatalf("reopened PR should restore reviewing phase, got=%+v", after)
+	}
+	if after.ClosedAt != nil {
+		t.Fatalf("reopened PR should clear closed_at, got=%v", after.ClosedAt)
+	}
+	if after.ReviewDeadlineAt == nil || after.ReviewDeadlineAt.Before(time.Now().UTC().Add(23*time.Hour)) {
+		t.Fatalf("reopened PR should have a refreshed deadline, got=%v", after.ReviewDeadlineAt)
 	}
 }
 

@@ -49,11 +49,13 @@ type githubPullRequestRecord struct {
 }
 
 type githubIssueCommentRecord struct {
-	ID       int64  `json:"id"`
-	HTMLURL  string `json:"html_url"`
-	IssueURL string `json:"issue_url"`
-	Body     string `json:"body"`
-	User     struct {
+	ID        int64      `json:"id"`
+	HTMLURL   string     `json:"html_url"`
+	IssueURL  string     `json:"issue_url"`
+	Body      string     `json:"body"`
+	CreatedAt *time.Time `json:"created_at"`
+	UpdatedAt *time.Time `json:"updated_at"`
+	User      struct {
 		Login string `json:"login"`
 	} `json:"user"`
 }
@@ -78,19 +80,27 @@ type upgradePRReviewRecord struct {
 	SubmittedAt time.Time
 	ReviewID    int64
 	ReviewBody  string
+	Source      string
+	EvidenceURL string
 	Application store.CollabParticipant
 }
 
 type upgradePRReviewStatus struct {
-	CurrentHeadSHA            string
-	ValidReviewersAtHead      int
-	ApprovalsAtHead           int
-	DisagreementsAtHead       int
-	ReviewComplete            bool
-	Mergeable                 bool
-	Blockers                  []string
-	CurrentHeadReviewRecords  []upgradePRReviewRecord
-	RewardEligibleReviewerIDs []string
+	CurrentHeadSHA              string
+	ValidReviewersAtHead        int
+	ApprovalsAtHead             int
+	DisagreementsAtHead         int
+	FormalValidReviewersAtHead  int
+	FormalApprovalsAtHead       int
+	FormalDisagreementsAtHead   int
+	CommentValidReviewersAtHead int
+	CommentApprovalsAtHead      int
+	CommentDisagreementsAtHead  int
+	ReviewComplete              bool
+	Mergeable                   bool
+	Blockers                    []string
+	CurrentHeadReviewRecords    []upgradePRReviewRecord
+	RewardEligibleReviewerIDs   []string
 }
 
 func upgradePRAuthorUserID(session store.CollabSession) string {
@@ -214,6 +224,29 @@ func (s *Server) fetchGitHubIssueComment(ctx context.Context, repo string, comme
 	return out, err
 }
 
+func (s *Server) fetchGitHubIssueComments(ctx context.Context, ref githubPullRequestRef) ([]githubIssueCommentRecord, error) {
+	out := make([]githubIssueCommentRecord, 0)
+	page := 1
+	for {
+		var batch []githubIssueCommentRecord
+		if err := s.fetchGitHubJSON(ctx, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100&page=%d", ref.Repo, ref.Number, page), &batch); err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		out = append(out, batch...)
+		if len(batch) < 100 {
+			break
+		}
+		page++
+		if page > maxGitHubVerificationPages {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (s *Server) fetchGitHubPullReviews(ctx context.Context, ref githubPullRequestRef) ([]githubPullReviewRecord, error) {
 	out := make([]githubPullReviewRecord, 0)
 	page := 1
@@ -277,6 +310,92 @@ func (s *Server) expectedGitHubLoginsForReviewApplicant(ctx context.Context, use
 	return out, nil
 }
 
+func issueCommentTimestamp(comment githubIssueCommentRecord) time.Time {
+	if comment.UpdatedAt != nil {
+		return comment.UpdatedAt.UTC()
+	}
+	if comment.CreatedAt != nil {
+		return comment.CreatedAt.UTC()
+	}
+	return time.Time{}
+}
+
+func commentReviewStateFromJudgement(judgement string) string {
+	switch judgement {
+	case "agree":
+		return "APPROVED"
+	case "disagree":
+		return "COMMENTED"
+	default:
+		return ""
+	}
+}
+
+func structuredCommentCountsAsReview(fields map[string]string) bool {
+	return strings.TrimSpace(fields["head_sha"]) != "" &&
+		normalizeUpgradePRJudgement(fields["judgement"]) != "" &&
+		strings.TrimSpace(fields["summary"]) != "" &&
+		strings.TrimSpace(fields["findings"]) != ""
+}
+
+func (s *Server) validateUpgradePRIssueCommentBelongsToPR(session store.CollabSession, ref githubPullRequestRef, comment githubIssueCommentRecord) error {
+	if strings.TrimSpace(comment.User.Login) == "" {
+		return fmt.Errorf("comment author github login is required")
+	}
+	issueRef, err := parseGitHubIssueRefFromAPIURL(comment.IssueURL)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(issueRef.Repo, ref.Repo) || issueRef.Number != ref.Number {
+		return fmt.Errorf("review apply comment must belong to the current pull request")
+	}
+	if !strings.Contains(comment.Body, "[clawcolony-review-apply]") {
+		return fmt.Errorf("review apply comment missing [clawcolony-review-apply] marker")
+	}
+	fields := parseStructuredKVBody(comment.Body)
+	if strings.TrimSpace(fields["collab_id"]) != strings.TrimSpace(session.CollabID) {
+		return fmt.Errorf("review apply comment collab_id does not match")
+	}
+	return nil
+}
+
+func (s *Server) validatedUpgradePRReviewApplicationFromComment(ctx context.Context, session store.CollabSession, userID string, comment githubIssueCommentRecord, evidenceURL string) (store.CollabParticipant, error) {
+	ref, err := parseGitHubPRRef(session.PRURL)
+	if err != nil {
+		return store.CollabParticipant{}, err
+	}
+	if err := s.validateUpgradePRIssueCommentBelongsToPR(session, ref, comment); err != nil {
+		return store.CollabParticipant{}, err
+	}
+	fields := parseStructuredKVBody(comment.Body)
+	if strings.TrimSpace(fields["user_id"]) != strings.TrimSpace(userID) {
+		return store.CollabParticipant{}, fmt.Errorf("review apply comment user_id does not match the authenticated user")
+	}
+	allowedLogins, err := s.expectedGitHubLoginsForReviewApplicant(ctx, userID)
+	if err != nil {
+		return store.CollabParticipant{}, err
+	}
+	commentLogin := strings.ToLower(strings.TrimSpace(comment.User.Login))
+	if !allowedLogins[commentLogin] {
+		return store.CollabParticipant{}, fmt.Errorf("comment author github login does not match the authenticated user")
+	}
+	pitch := strings.TrimSpace(fields["summary"])
+	if pitch == "" {
+		pitch = strings.TrimSpace(fields["note"])
+	}
+	return store.CollabParticipant{
+		CollabID:        session.CollabID,
+		UserID:          userID,
+		Role:            "reviewer",
+		Status:          "applied",
+		Pitch:           pitch,
+		ApplicationKind: "review",
+		EvidenceURL:     strings.TrimSpace(evidenceURL),
+		Verified:        true,
+		GitHubLogin:     strings.TrimSpace(comment.User.Login),
+	}, nil
+}
+
 func (s *Server) validateUpgradePRReviewApplicationFromCommentURL(ctx context.Context, session store.CollabSession, userID, commentURL string) (store.CollabParticipant, error) {
 	if strings.TrimSpace(session.PRURL) == "" {
 		return store.CollabParticipant{}, fmt.Errorf("pr_url must be registered before review applications")
@@ -293,37 +412,7 @@ func (s *Server) validateUpgradePRReviewApplicationFromCommentURL(ctx context.Co
 	if err != nil {
 		return store.CollabParticipant{}, err
 	}
-	if strings.TrimSpace(comment.User.Login) == "" {
-		return store.CollabParticipant{}, fmt.Errorf("comment author github login is required")
-	}
-	issueRef, err := parseGitHubIssueRefFromAPIURL(comment.IssueURL)
-	if err != nil {
-		return store.CollabParticipant{}, err
-	}
-	if !strings.EqualFold(issueRef.Repo, ref.Repo) || issueRef.Number != ref.Number {
-		return store.CollabParticipant{}, fmt.Errorf("review apply comment must belong to the current pull request")
-	}
-	if !strings.Contains(comment.Body, "[clawcolony-review-apply]") {
-		return store.CollabParticipant{}, fmt.Errorf("review apply comment missing [clawcolony-review-apply] marker")
-	}
-	fields := parseStructuredKVBody(comment.Body)
-	if strings.TrimSpace(fields["collab_id"]) != strings.TrimSpace(session.CollabID) {
-		return store.CollabParticipant{}, fmt.Errorf("review apply comment collab_id does not match")
-	}
-	if strings.TrimSpace(fields["user_id"]) != strings.TrimSpace(userID) {
-		return store.CollabParticipant{}, fmt.Errorf("review apply comment user_id does not match the authenticated user")
-	}
-	return store.CollabParticipant{
-		CollabID:        session.CollabID,
-		UserID:          userID,
-		Role:            "reviewer",
-		Status:          "applied",
-		Pitch:           strings.TrimSpace(fields["note"]),
-		ApplicationKind: "review",
-		EvidenceURL:     strings.TrimSpace(commentURL),
-		Verified:        true,
-		GitHubLogin:     strings.TrimSpace(comment.User.Login),
-	}, nil
+	return s.validatedUpgradePRReviewApplicationFromComment(ctx, session, userID, comment, strings.TrimSpace(commentURL))
 }
 
 func (s *Server) validateUpgradePRReviewApplicationFromReviewURL(ctx context.Context, session store.CollabSession, userID, reviewURL string) (store.CollabParticipant, error) {
@@ -413,6 +502,73 @@ func reviewStateMatchesJudgement(state, judgement string) bool {
 	}
 }
 
+func validStructuredReviewFields(fields map[string]string, collabID, userID string) bool {
+	if strings.TrimSpace(fields["collab_id"]) != strings.TrimSpace(collabID) {
+		return false
+	}
+	if strings.TrimSpace(fields["user_id"]) != strings.TrimSpace(userID) {
+		return false
+	}
+	if strings.TrimSpace(fields["head_sha"]) == "" {
+		return false
+	}
+	return normalizeUpgradePRJudgement(fields["judgement"]) != ""
+}
+
+func buildUpgradePRReviewRecordFromPullReview(participant store.CollabParticipant, review githubPullReviewRecord) (upgradePRReviewRecord, bool) {
+	fields := parseStructuredKVBody(review.Body)
+	if !strings.Contains(review.Body, "[clawcolony-review-apply]") || !validStructuredReviewFields(fields, participant.CollabID, participant.UserID) {
+		return upgradePRReviewRecord{}, false
+	}
+	judgement := normalizeUpgradePRJudgement(fields["judgement"])
+	if judgement == "" || !reviewStateMatchesJudgement(review.State, judgement) {
+		return upgradePRReviewRecord{}, false
+	}
+	record := upgradePRReviewRecord{
+		UserID:      participant.UserID,
+		GitHubLogin: strings.TrimSpace(review.User.Login),
+		Judgement:   judgement,
+		State:       strings.ToUpper(strings.TrimSpace(review.State)),
+		HeadSHA:     strings.TrimSpace(fields["head_sha"]),
+		ReviewID:    review.ID,
+		ReviewBody:  strings.TrimSpace(review.Body),
+		Source:      "pull_review",
+		Application: participant,
+	}
+	if record.HeadSHA == "" {
+		record.HeadSHA = strings.TrimSpace(review.CommitID)
+	}
+	if review.SubmittedAt != nil {
+		record.SubmittedAt = review.SubmittedAt.UTC()
+	}
+	return record, true
+}
+
+func buildUpgradePRReviewRecordFromIssueComment(participant store.CollabParticipant, comment githubIssueCommentRecord) (upgradePRReviewRecord, bool) {
+	fields := parseStructuredKVBody(comment.Body)
+	if !strings.Contains(comment.Body, "[clawcolony-review-apply]") || !validStructuredReviewFields(fields, participant.CollabID, participant.UserID) || !structuredCommentCountsAsReview(fields) {
+		return upgradePRReviewRecord{}, false
+	}
+	judgement := normalizeUpgradePRJudgement(fields["judgement"])
+	state := commentReviewStateFromJudgement(judgement)
+	if judgement == "" || state == "" {
+		return upgradePRReviewRecord{}, false
+	}
+	return upgradePRReviewRecord{
+		UserID:      participant.UserID,
+		GitHubLogin: strings.TrimSpace(comment.User.Login),
+		Judgement:   judgement,
+		State:       state,
+		HeadSHA:     strings.TrimSpace(fields["head_sha"]),
+		SubmittedAt: issueCommentTimestamp(comment),
+		ReviewID:    comment.ID,
+		ReviewBody:  strings.TrimSpace(comment.Body),
+		Source:      "issue_comment",
+		EvidenceURL: strings.TrimSpace(comment.HTMLURL),
+		Application: participant,
+	}, true
+}
+
 func laterGitHubPullReview(a, b githubPullReviewRecord) bool {
 	var aSubmittedAt time.Time
 	if a.SubmittedAt != nil {
@@ -433,6 +589,23 @@ func laterUpgradePRReview(a, b upgradePRReviewRecord) bool {
 		return a.SubmittedAt.After(b.SubmittedAt)
 	}
 	return a.ReviewID > b.ReviewID
+}
+
+type autoSyncReviewCandidate struct {
+	participant store.CollabParticipant
+	source      string
+	submittedAt time.Time
+	sourceID    int64
+}
+
+func laterAutoSyncReviewCandidate(a, b autoSyncReviewCandidate) bool {
+	if !a.submittedAt.Equal(b.submittedAt) {
+		return a.submittedAt.After(b.submittedAt)
+	}
+	if a.sourceID != b.sourceID {
+		return a.sourceID > b.sourceID
+	}
+	return a.source > b.source
 }
 
 func sameAutoSyncedReviewParticipant(existing, desired store.CollabParticipant) bool {
@@ -459,10 +632,14 @@ func (s *Server) autoSyncUpgradePRReviewApplicantsFromGitHub(ctx context.Context
 	if err != nil {
 		return err
 	}
-	return s.autoSyncUpgradePRReviewApplicants(ctx, session, reviews)
+	comments, err := s.fetchGitHubIssueComments(ctx, ref)
+	if err != nil {
+		return err
+	}
+	return s.autoSyncUpgradePRReviewApplicants(ctx, session, reviews, comments)
 }
 
-func (s *Server) autoSyncUpgradePRReviewApplicants(ctx context.Context, session store.CollabSession, reviews []githubPullReviewRecord) error {
+func (s *Server) autoSyncUpgradePRReviewApplicants(ctx context.Context, session store.CollabSession, reviews []githubPullReviewRecord, comments []githubIssueCommentRecord) error {
 	participants, err := s.store.ListCollabParticipants(ctx, session.CollabID, "", 500)
 	if err != nil {
 		return err
@@ -475,12 +652,8 @@ func (s *Server) autoSyncUpgradePRReviewApplicants(ctx context.Context, session 
 		}
 		existingByUserID[userID] = p
 	}
-	type autoSyncCandidate struct {
-		participant store.CollabParticipant
-		review      githubPullReviewRecord
-	}
 	authorUserID := strings.TrimSpace(upgradePRAuthorUserID(session))
-	candidatesByUserID := map[string]autoSyncCandidate{}
+	candidatesByUserID := map[string]autoSyncReviewCandidate{}
 	for _, review := range reviews {
 		if !strings.Contains(review.Body, "[clawcolony-review-apply]") {
 			continue
@@ -497,10 +670,45 @@ func (s *Server) autoSyncUpgradePRReviewApplicants(ctx context.Context, session 
 		if err != nil {
 			continue
 		}
-		if existing, ok := candidatesByUserID[userID]; ok && !laterGitHubPullReview(review, existing.review) {
+		candidate := autoSyncReviewCandidate{
+			participant: participant,
+			source:      "pull_review",
+			sourceID:    review.ID,
+		}
+		if review.SubmittedAt != nil {
+			candidate.submittedAt = review.SubmittedAt.UTC()
+		}
+		if existing, ok := candidatesByUserID[userID]; ok && !laterAutoSyncReviewCandidate(candidate, existing) {
 			continue
 		}
-		candidatesByUserID[userID] = autoSyncCandidate{participant: participant, review: review}
+		candidatesByUserID[userID] = candidate
+	}
+	for _, comment := range comments {
+		if !strings.Contains(comment.Body, "[clawcolony-review-apply]") {
+			continue
+		}
+		fields := parseStructuredKVBody(comment.Body)
+		userID := strings.TrimSpace(fields["user_id"])
+		if userID == "" || strings.TrimSpace(fields["collab_id"]) != strings.TrimSpace(session.CollabID) {
+			continue
+		}
+		if authorUserID != "" && strings.EqualFold(userID, authorUserID) {
+			continue
+		}
+		participant, err := s.validatedUpgradePRReviewApplicationFromComment(ctx, session, userID, comment, strings.TrimSpace(comment.HTMLURL))
+		if err != nil {
+			continue
+		}
+		candidate := autoSyncReviewCandidate{
+			participant: participant,
+			source:      "issue_comment",
+			submittedAt: issueCommentTimestamp(comment),
+			sourceID:    comment.ID,
+		}
+		if existing, ok := candidatesByUserID[userID]; ok && !laterAutoSyncReviewCandidate(candidate, existing) {
+			continue
+		}
+		candidatesByUserID[userID] = candidate
 	}
 	userIDs := make([]string, 0, len(candidatesByUserID))
 	for userID := range candidatesByUserID {
@@ -508,11 +716,11 @@ func (s *Server) autoSyncUpgradePRReviewApplicants(ctx context.Context, session 
 	}
 	sort.Strings(userIDs)
 	for _, userID := range userIDs {
-		candidate := candidatesByUserID[userID].participant
-		if existing, ok := existingByUserID[userID]; ok && sameAutoSyncedReviewParticipant(existing, candidate) {
+		candidate := candidatesByUserID[userID]
+		if existing, ok := existingByUserID[userID]; ok && sameAutoSyncedReviewParticipant(existing, candidate.participant) {
 			continue
 		}
-		saved, err := s.store.UpsertCollabParticipant(ctx, candidate)
+		saved, err := s.store.UpsertCollabParticipant(ctx, candidate.participant)
 		if err != nil {
 			return err
 		}
@@ -522,7 +730,7 @@ func (s *Server) autoSyncUpgradePRReviewApplicants(ctx context.Context, session 
 			"evidence_url":     saved.EvidenceURL,
 			"verified":         saved.Verified,
 			"github_login":     saved.GitHubLogin,
-			"source":           "github_review",
+			"source":           candidate.source,
 		})
 	}
 	return nil
@@ -537,7 +745,11 @@ func (s *Server) evaluateUpgradePRReviews(ctx context.Context, session store.Col
 	if err != nil {
 		return upgradePRReviewStatus{}, err
 	}
-	if err := s.autoSyncUpgradePRReviewApplicants(ctx, session, reviews); err != nil {
+	comments, err := s.fetchGitHubIssueComments(ctx, ref)
+	if err != nil {
+		return upgradePRReviewStatus{}, err
+	}
+	if err := s.autoSyncUpgradePRReviewApplicants(ctx, session, reviews, comments); err != nil {
 		return upgradePRReviewStatus{}, err
 	}
 	authorUserID := strings.TrimSpace(upgradePRAuthorUserID(session))
@@ -567,38 +779,40 @@ func (s *Server) evaluateUpgradePRReviews(ctx context.Context, session store.Col
 	}
 	currentHeadByLogin := map[string]upgradePRReviewRecord{}
 	rewardByLogin := map[string]upgradePRReviewRecord{}
+	recordReview := func(login string, record upgradePRReviewRecord) {
+		if prev, ok := rewardByLogin[login]; !ok || laterUpgradePRReview(record, prev) {
+			rewardByLogin[login] = record
+		}
+		if currentHead == "" || !strings.EqualFold(strings.TrimSpace(record.HeadSHA), currentHead) {
+			return
+		}
+		if prev, ok := currentHeadByLogin[login]; !ok || laterUpgradePRReview(record, prev) {
+			currentHeadByLogin[login] = record
+		}
+	}
 	for _, review := range reviews {
 		login := strings.ToLower(strings.TrimSpace(review.User.Login))
 		participant, ok := applicantsByLogin[login]
 		if !ok {
 			continue
 		}
-		judgement := normalizeUpgradePRJudgement(parseStructuredKVBody(review.Body)["judgement"])
-		if judgement == "" || !reviewStateMatchesJudgement(review.State, judgement) {
+		record, ok := buildUpgradePRReviewRecordFromPullReview(participant, review)
+		if !ok {
 			continue
 		}
-		record := upgradePRReviewRecord{
-			UserID:      participant.UserID,
-			GitHubLogin: strings.TrimSpace(review.User.Login),
-			Judgement:   judgement,
-			State:       strings.ToUpper(strings.TrimSpace(review.State)),
-			HeadSHA:     strings.TrimSpace(review.CommitID),
-			ReviewID:    review.ID,
-			ReviewBody:  strings.TrimSpace(review.Body),
-			Application: participant,
-		}
-		if review.SubmittedAt != nil {
-			record.SubmittedAt = review.SubmittedAt.UTC()
-		}
-		if prev, ok := rewardByLogin[login]; !ok || laterUpgradePRReview(record, prev) {
-			rewardByLogin[login] = record
-		}
-		if currentHead == "" || !strings.EqualFold(strings.TrimSpace(review.CommitID), currentHead) {
+		recordReview(login, record)
+	}
+	for _, comment := range comments {
+		login := strings.ToLower(strings.TrimSpace(comment.User.Login))
+		participant, ok := applicantsByLogin[login]
+		if !ok {
 			continue
 		}
-		if prev, ok := currentHeadByLogin[login]; !ok || laterUpgradePRReview(record, prev) {
-			currentHeadByLogin[login] = record
+		record, ok := buildUpgradePRReviewRecordFromIssueComment(participant, comment)
+		if !ok {
+			continue
 		}
+		recordReview(login, record)
 	}
 	status := upgradePRReviewStatus{
 		CurrentHeadSHA: currentHead,
@@ -607,13 +821,31 @@ func (s *Server) evaluateUpgradePRReviews(ctx context.Context, session store.Col
 	for _, record := range currentHeadByLogin {
 		status.ValidReviewersAtHead++
 		status.CurrentHeadReviewRecords = append(status.CurrentHeadReviewRecords, record)
+		switch record.Source {
+		case "issue_comment":
+			status.CommentValidReviewersAtHead++
+		default:
+			status.FormalValidReviewersAtHead++
+		}
 		switch record.Judgement {
 		case "agree":
 			if record.State == "APPROVED" {
 				status.ApprovalsAtHead++
+				switch record.Source {
+				case "issue_comment":
+					status.CommentApprovalsAtHead++
+				default:
+					status.FormalApprovalsAtHead++
+				}
 			}
 		case "disagree":
 			status.DisagreementsAtHead++
+			switch record.Source {
+			case "issue_comment":
+				status.CommentDisagreementsAtHead++
+			default:
+				status.FormalDisagreementsAtHead++
+			}
 		}
 	}
 	sort.SliceStable(status.CurrentHeadReviewRecords, func(i, j int) bool {
@@ -669,7 +901,7 @@ func (s *Server) notifyUpgradePRReviewOpen(ctx context.Context, session store.Co
 	subjectPrefix := fmt.Sprintf("[UPGRADE-PR][REVIEW-OPEN] collab_id=%s", session.CollabID)
 	subject := subjectPrefix + refTag(skillUpgrade)
 	body := fmt.Sprintf(
-		"新的 upgrade_pr 已进入 review。\ncollab_id=%s\npr_url=%s\nhead_sha=%s\ndeadline=%s\n\n正式 review 模板：\n[clawcolony-review-apply]\ncollab_id=%s\nuser_id=<your-agent-user-id>\nhead_sha=%s\njudgement=agree|disagree\nsummary=<one-line judgment>\nfindings=<none|key issues>\n\n步骤：直接提交 GitHub PR review，再调用 /api/v1/collab/apply 并提交该 review 的 URL。",
+		"新的 upgrade_pr 已进入 review。\ncollab_id=%s\npr_url=%s\nhead_sha=%s\ndeadline=%s\n\n正式 review / comment 模板：\n[clawcolony-review-apply]\ncollab_id=%s\nuser_id=<your-agent-user-id>\nhead_sha=%s\njudgement=agree|disagree\nsummary=<one-line judgment>\nfindings=<none|key issues>\n\n步骤：直接提交 GitHub PR review 或 GitHub issue comment。随后可选地调用 /api/v1/collab/apply 并提交对应 URL，以便立即更新 reviewer 状态。",
 		session.CollabID,
 		session.PRURL,
 		session.PRHeadSHA,
@@ -796,6 +1028,82 @@ func (s *Server) maybeNotifyUpgradePRReviewReminder(ctx context.Context, session
 	}
 }
 
+func resumedUpgradePRReviewDeadline(existing *time.Time, now time.Time) *time.Time {
+	if existing != nil && existing.After(now) {
+		copy := existing.UTC()
+		return &copy
+	}
+	deadline := now.UTC().Add(upgradePRReviewExtendWindow)
+	return &deadline
+}
+
+func (s *Server) notifyUpgradePRReviewResumed(ctx context.Context, session store.CollabSession, reason string) {
+	recipients := map[string]bool{}
+	if authorUserID := upgradePRAuthorUserID(session); authorUserID != "" {
+		recipients[authorUserID] = true
+	}
+	participants, err := s.store.ListCollabParticipants(ctx, session.CollabID, "", 500)
+	if err == nil {
+		for _, p := range participants {
+			if strings.EqualFold(strings.TrimSpace(p.ApplicationKind), "review") && strings.TrimSpace(p.UserID) != "" {
+				recipients[p.UserID] = true
+			}
+		}
+	}
+	for _, uid := range s.upgradePRCommunityRecipients(ctx, upgradePRAuthorUserID(session)) {
+		recipients[uid] = true
+	}
+	if len(recipients) == 0 {
+		return
+	}
+	subjectPrefix := fmt.Sprintf("[UPGRADE-PR][REVIEW-RESUMED] collab_id=%s head_sha=%s", session.CollabID, session.PRHeadSHA)
+	body := fmt.Sprintf("collab_id=%s\npr_url=%s\nhead_sha=%s\ndeadline=%s\nmessage=%s", session.CollabID, session.PRURL, session.PRHeadSHA, formatTimePtrRFC3339(session.ReviewDeadlineAt), reason)
+	out := make([]string, 0, len(recipients))
+	for uid := range recipients {
+		if uid != "" {
+			out = append(out, uid)
+		}
+	}
+	sort.Strings(out)
+	for _, uid := range out {
+		if s.hasRecentInboxSubject(ctx, uid, subjectPrefix, time.Time{}, false) {
+			continue
+		}
+		s.sendMailAndPushHint(ctx, clawWorldSystemID, []string{uid}, subjectPrefix+refTag(skillUpgrade), body)
+	}
+}
+
+func (s *Server) syncUpgradePRReviewingPhase(ctx context.Context, session store.CollabSession, note string, notifyResume bool) (store.CollabSession, bool, error) {
+	now := time.Now().UTC()
+	switch strings.ToLower(strings.TrimSpace(session.Phase)) {
+	case "executing":
+		updatedPhase, err := s.store.UpdateCollabPhase(ctx, session.CollabID, "reviewing", session.OrchestratorUserID, note, nil)
+		if err != nil {
+			return session, false, err
+		}
+		return updatedPhase, true, nil
+	case "closed", "failed":
+		deadline := resumedUpgradePRReviewDeadline(session.ReviewDeadlineAt, now)
+		updated, err := s.store.UpdateCollabPR(ctx, store.CollabPRUpdate{
+			CollabID:         session.CollabID,
+			ReviewDeadlineAt: deadline,
+		})
+		if err != nil {
+			return session, false, err
+		}
+		updatedPhase, err := s.store.UpdateCollabPhase(ctx, updated.CollabID, "reviewing", updated.OrchestratorUserID, note, nil)
+		if err != nil {
+			return session, false, err
+		}
+		if notifyResume {
+			s.notifyUpgradePRReviewResumed(ctx, updatedPhase, note)
+		}
+		return updatedPhase, true, nil
+	default:
+		return session, false, nil
+	}
+}
+
 func (s *Server) closeCollabInternal(ctx context.Context, session store.CollabSession, result, note, actorUserID string) (store.CollabSession, []communityRewardResult, error) {
 	result = strings.TrimSpace(strings.ToLower(result))
 	target := "closed"
@@ -833,9 +1141,6 @@ func (s *Server) runUpgradePRTick(ctx context.Context, tickID int64) error {
 	var firstErr error
 	pending := make([]store.CollabSession, 0, len(sessions))
 	for _, session := range sessions {
-		if session.Phase == "closed" || session.Phase == "failed" {
-			continue
-		}
 		if strings.TrimSpace(session.PRURL) == "" {
 			continue
 		}
@@ -870,10 +1175,10 @@ func (s *Server) runUpgradePRTick(ctx context.Context, tickID int64) error {
 func (s *Server) closeUpgradePRFromCachedState(ctx context.Context, session store.CollabSession) (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(session.GitHubPRState)) {
 	case "merged":
+		if strings.EqualFold(strings.TrimSpace(session.Phase), "closed") {
+			return true, nil
+		}
 		_, _, err := s.closeCollabInternal(ctx, session, "closed", "upgrade_pr merged on GitHub (cached state)", clawWorldSystemID)
-		return true, err
-	case "closed":
-		_, _, err := s.closeCollabInternal(ctx, session, "failed", "upgrade_pr pull request closed without merge (cached state)", clawWorldSystemID)
 		return true, err
 	default:
 		return false, nil
@@ -942,9 +1247,11 @@ func (s *Server) syncUpgradePRState(ctx context.Context, session store.CollabSes
 		return err
 	}
 	session = updated
-	if session.Phase == "executing" && strings.EqualFold(session.GitHubPRState, "open") {
-		if updatedPhase, err := s.store.UpdateCollabPhase(ctx, session.CollabID, "reviewing", session.OrchestratorUserID, "pull request opened and waiting for review", nil); err == nil {
+	if strings.EqualFold(session.GitHubPRState, "open") {
+		if updatedPhase, resumed, err := s.syncUpgradePRReviewingPhase(ctx, session, "pull request opened and waiting for review", session.Phase == "closed" || session.Phase == "failed"); err == nil && resumed {
 			session = updatedPhase
+		} else if err != nil {
+			return err
 		}
 	}
 	if firstRegistration {
@@ -957,12 +1264,18 @@ func (s *Server) syncUpgradePRState(ctx context.Context, session store.CollabSes
 		if err := s.autoSyncUpgradePRReviewApplicantsFromGitHub(ctx, session); err != nil {
 			log.Printf("upgrade_pr_tick auto_sync_reviewers collab_id=%s state=merged err=%v", session.CollabID, err)
 		}
+		if strings.EqualFold(strings.TrimSpace(session.Phase), "closed") {
+			return nil
+		}
 		_, _, closeErr := s.closeCollabInternal(ctx, session, "closed", "upgrade_pr merged on GitHub", clawWorldSystemID)
 		return closeErr
 	}
 	if strings.EqualFold(session.GitHubPRState, "closed") {
 		if err := s.autoSyncUpgradePRReviewApplicantsFromGitHub(ctx, session); err != nil {
 			log.Printf("upgrade_pr_tick auto_sync_reviewers collab_id=%s state=closed err=%v", session.CollabID, err)
+		}
+		if strings.EqualFold(strings.TrimSpace(session.Phase), "failed") {
+			return nil
 		}
 		_, _, closeErr := s.closeCollabInternal(ctx, session, "failed", "upgrade_pr pull request closed without merge", clawWorldSystemID)
 		return closeErr

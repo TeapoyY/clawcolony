@@ -6435,6 +6435,11 @@ func (s *Server) handleCollabAssign(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	ownerUserID := collabActionOwnerUserID(session)
+	if ownerUserID != "" && orchestratorUserID != ownerUserID {
+		writeError(w, http.StatusForbidden, "only current collab owner can assign participants")
+		return
+	}
 	if session.Kind == "upgrade_pr" {
 		writeError(w, http.StatusConflict, "upgrade_pr uses author-led flow; assign is not used")
 		return
@@ -6686,8 +6691,68 @@ func (s *Server) handleCollabClose(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "only current collab owner can close collab")
 		return
 	}
-	if !canTransitCollabPhase(session.Phase, target) {
+	if session.Kind == "upgrade_pr" {
+		if strings.TrimSpace(session.PRURL) == "" {
+			writeError(w, http.StatusConflict, "upgrade_pr terminal state is derived from GitHub; pr_url is required")
+			return
+		}
+		ref, err := parseGitHubPRRef(session.PRURL)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		pull, err := s.fetchGitHubPullRequest(r.Context(), ref)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		session, err = s.store.UpdateCollabPR(r.Context(), store.CollabPRUpdate{
+			CollabID:      session.CollabID,
+			PRBranch:      session.PRBranch,
+			PRURL:         session.PRURL,
+			PRNumber:      pull.Number,
+			PRBaseSHA:     strings.TrimSpace(pull.Base.SHA),
+			PRHeadSHA:     strings.TrimSpace(pull.Head.SHA),
+			PRAuthorLogin: strings.TrimSpace(pull.User.Login),
+			GitHubPRState: func() string {
+				if pull.Merged {
+					return "merged"
+				}
+				return strings.ToLower(strings.TrimSpace(pull.State))
+			}(),
+			PRMergeCommitSHA: strings.TrimSpace(pull.MergeCommitSHA),
+			PRMergedAt:       pull.MergedAt,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if strings.EqualFold(session.GitHubPRState, "open") {
+			updatedPhase, resumed, phaseErr := s.syncUpgradePRReviewingPhase(r.Context(), session, "pull request reopened and review resumed", strings.EqualFold(session.Phase, "closed") || strings.EqualFold(session.Phase, "failed"))
+			if phaseErr != nil {
+				writeError(w, http.StatusInternalServerError, phaseErr.Error())
+				return
+			}
+			if resumed {
+				session = updatedPhase
+			}
+			writeError(w, http.StatusConflict, "upgrade_pr terminal state is derived from GitHub; pull request is still open")
+			return
+		}
+		if pull.Merged {
+			target = "closed"
+			req.Result = "closed"
+		} else {
+			target = "failed"
+			req.Result = "failed"
+		}
+	}
+	if session.Kind != "upgrade_pr" && !canTransitCollabPhase(session.Phase, target) {
 		writeError(w, http.StatusConflict, "phase transition not allowed")
+		return
+	}
+	if strings.EqualFold(session.Phase, target) {
+		writeJSON(w, http.StatusAccepted, map[string]any{"item": session})
 		return
 	}
 	item, rewards, closeErr := s.closeCollabInternal(r.Context(), session, req.Result, req.StatusOrSummaryNote, orchestratorUserID)
@@ -6860,8 +6925,13 @@ func (s *Server) handleCollabUpdatePR(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if updated.Phase == "executing" && strings.EqualFold(updated.GitHubPRState, "open") {
-		if phaseItem, phaseErr := s.store.UpdateCollabPhase(r.Context(), updated.CollabID, "reviewing", updated.OrchestratorUserID, "pull request opened and waiting for review", nil); phaseErr == nil {
+	if strings.EqualFold(updated.GitHubPRState, "open") {
+		phaseItem, resumed, phaseErr := s.syncUpgradePRReviewingPhase(r.Context(), updated, "pull request opened and waiting for review", strings.EqualFold(updated.Phase, "closed") || strings.EqualFold(updated.Phase, "failed"))
+		if phaseErr != nil {
+			writeError(w, http.StatusInternalServerError, phaseErr.Error())
+			return
+		}
+		if resumed {
 			updated = phaseItem
 		}
 	}
@@ -6900,16 +6970,22 @@ func (s *Server) handleCollabMergeGate(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(session.PRURL) == "" {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"collab_id":               session.CollabID,
-			"pr_url":                  session.PRURL,
-			"pr_head_sha":             session.PRHeadSHA,
-			"valid_reviewers_at_head": 0,
-			"approvals_at_head":       0,
-			"disagreements_at_head":   0,
-			"review_complete":         false,
-			"mergeable":               false,
-			"review_deadline_at":      session.ReviewDeadlineAt,
-			"blockers":                []string{"pr_url is not registered"},
+			"collab_id":                       session.CollabID,
+			"pr_url":                          session.PRURL,
+			"pr_head_sha":                     session.PRHeadSHA,
+			"valid_reviewers_at_head":         0,
+			"approvals_at_head":               0,
+			"disagreements_at_head":           0,
+			"formal_valid_reviewers_at_head":  0,
+			"formal_approvals_at_head":        0,
+			"formal_disagreements_at_head":    0,
+			"comment_valid_reviewers_at_head": 0,
+			"comment_approvals_at_head":       0,
+			"comment_disagreements_at_head":   0,
+			"review_complete":                 false,
+			"mergeable":                       false,
+			"review_deadline_at":              session.ReviewDeadlineAt,
+			"blockers":                        []string{"pr_url is not registered"},
 		})
 		return
 	}
@@ -6936,17 +7012,23 @@ func (s *Server) handleCollabMergeGate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"collab_id":               session.CollabID,
-		"pr_url":                  session.PRURL,
-		"pr_head_sha":             session.PRHeadSHA,
-		"valid_reviewers_at_head": status.ValidReviewersAtHead,
-		"approvals_at_head":       status.ApprovalsAtHead,
-		"disagreements_at_head":   status.DisagreementsAtHead,
-		"review_complete":         status.ReviewComplete,
-		"review_deadline_at":      session.ReviewDeadlineAt,
-		"tests_passed":            "unknown",
-		"mergeable":               status.Mergeable,
-		"blockers":                status.Blockers,
+		"collab_id":                       session.CollabID,
+		"pr_url":                          session.PRURL,
+		"pr_head_sha":                     session.PRHeadSHA,
+		"valid_reviewers_at_head":         status.ValidReviewersAtHead,
+		"approvals_at_head":               status.ApprovalsAtHead,
+		"disagreements_at_head":           status.DisagreementsAtHead,
+		"formal_valid_reviewers_at_head":  status.FormalValidReviewersAtHead,
+		"formal_approvals_at_head":        status.FormalApprovalsAtHead,
+		"formal_disagreements_at_head":    status.FormalDisagreementsAtHead,
+		"comment_valid_reviewers_at_head": status.CommentValidReviewersAtHead,
+		"comment_approvals_at_head":       status.CommentApprovalsAtHead,
+		"comment_disagreements_at_head":   status.CommentDisagreementsAtHead,
+		"review_complete":                 status.ReviewComplete,
+		"review_deadline_at":              session.ReviewDeadlineAt,
+		"tests_passed":                    "unknown",
+		"mergeable":                       status.Mergeable,
+		"blockers":                        status.Blockers,
 	})
 }
 

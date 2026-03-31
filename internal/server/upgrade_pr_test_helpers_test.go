@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -64,6 +65,48 @@ func newFakeUpgradePRGitHub(t *testing.T, repo string, number int) *fakeUpgradeP
 			if err := json.NewEncoder(w).Encode(comment); err != nil {
 				t.Fatalf("encode fake comment: %v", err)
 			}
+		case r.URL.Path == fmt.Sprintf("/repos/%s/issues/%d/comments", fixture.repo, fixture.number):
+			fixture.commentRequests++
+			if fixture.requestHook != nil && fixture.requestHook(w, r) {
+				return
+			}
+			page := 1
+			if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+				if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+					page = parsed
+				}
+			}
+			perPage := 100
+			if raw := strings.TrimSpace(r.URL.Query().Get("per_page")); raw != "" {
+				if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+					perPage = parsed
+				}
+			}
+			items := make([]githubIssueCommentRecord, 0, len(fixture.comments))
+			for _, comment := range fixture.comments {
+				items = append(items, comment)
+			}
+			sort.SliceStable(items, func(i, j int) bool {
+				ti := issueCommentTimestamp(items[i])
+				tj := issueCommentTimestamp(items[j])
+				if !ti.Equal(tj) {
+					return ti.Before(tj)
+				}
+				return items[i].ID < items[j].ID
+			})
+			start := (page - 1) * perPage
+			if start >= len(items) {
+				items = []githubIssueCommentRecord{}
+			} else {
+				end := start + perPage
+				if end > len(items) {
+					end = len(items)
+				}
+				items = items[start:end]
+			}
+			if err := json.NewEncoder(w).Encode(items); err != nil {
+				t.Fatalf("encode fake comment list: %v", err)
+			}
 		case r.URL.Path == fmt.Sprintf("/repos/%s/pulls/%d/reviews", fixture.repo, fixture.number):
 			fixture.reviewRequests++
 			if fixture.requestHook != nil && fixture.requestHook(w, r) {
@@ -112,15 +155,43 @@ func (f *fakeUpgradePRGitHub) reviewURL(reviewID int64) string {
 }
 
 func makeUpgradePRApplyComment(repo string, number int, commentID int64, githubLogin, collabID, userID, note string) githubIssueCommentRecord {
+	now := time.Now().UTC()
 	comment := githubIssueCommentRecord{
-		ID:       commentID,
-		HTMLURL:  fmt.Sprintf("https://github.com/%s/pull/%d#issuecomment-%d", repo, number, commentID),
-		IssueURL: fmt.Sprintf("https://api.github.com/repos/%s/issues/%d", repo, number),
+		ID:        commentID,
+		HTMLURL:   fmt.Sprintf("https://github.com/%s/pull/%d#issuecomment-%d", repo, number, commentID),
+		IssueURL:  fmt.Sprintf("https://api.github.com/repos/%s/issues/%d", repo, number),
+		CreatedAt: &now,
+		UpdatedAt: &now,
 		Body: fmt.Sprintf(
 			"[clawcolony-review-apply]\ncollab_id=%s\nuser_id=%s\nnote=%s",
 			collabID,
 			userID,
 			note,
+		),
+	}
+	comment.User.Login = githubLogin
+	return comment
+}
+
+func makeStructuredUpgradePRReviewComment(repo string, number int, commentID int64, githubLogin, collabID, userID, headSHA, judgement, summary, findings string, updatedAt time.Time) githubIssueCommentRecord {
+	when := updatedAt.UTC()
+	if when.IsZero() {
+		when = time.Now().UTC()
+	}
+	comment := githubIssueCommentRecord{
+		ID:        commentID,
+		HTMLURL:   fmt.Sprintf("https://github.com/%s/pull/%d#issuecomment-%d", repo, number, commentID),
+		IssueURL:  fmt.Sprintf("https://api.github.com/repos/%s/issues/%d", repo, number),
+		CreatedAt: &when,
+		UpdatedAt: &when,
+		Body: fmt.Sprintf(
+			"[clawcolony-review-apply]\ncollab_id=%s\nuser_id=%s\nhead_sha=%s\njudgement=%s\nsummary=%s\nfindings=%s",
+			collabID,
+			userID,
+			headSHA,
+			judgement,
+			summary,
+			findings,
 		),
 	}
 	comment.User.Login = githubLogin
